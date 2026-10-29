@@ -1,0 +1,13 @@
+# Системни файлове
+.DS_Store
+Thumbs.db
+
+# Backup / временни файлове
+*.bak
+*.tmp
+*.log
+
+# Редактори
+*.swp
+.idea/
+.vscode/

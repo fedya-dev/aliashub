@@ -1,0 +1,2177 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  ALIASHUB v4.0 — Алиас мениджър за Bash и Zsh
+#  Автор: Федя Серафиев  ·  https://fedia.eu
+#  Лиценз: Open Source (MIT)
+#  Платформа: Linux / macOS / WSL (Bash 3.2+)
+# ============================================================================
+# Ако е стартиран от друг шел (sh, zsh, dash) — рестартирай се под Bash.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
+VERSION="4.0.0"
+ALIASHUB_SITE="https://fedia.eu"
+HEADER_WIDTH=70
+
+# ---------------------------- Конфигурация ---------------------------------
+# ALIASHUB_FILE         път до файла с алиаси        (по подразбиране ~/.fedya_aliases)
+# ALIASHUB_BACKUP_DIR   папка за backup-и            (по подразбиране ~/.config/aliashub/backups)
+# ALIASHUB_MAX_BACKUPS  колко backup-а да се пазят   (по подразбиране 50)
+# ALIASHUB_LANG         език на интерфейса bg|en     (иначе: конфиг → LC_ALL/LANG → bg)
+# NO_COLOR              изключва цветове (стандарт https://no-color.org)
+# Остарелите имена ALIASCTL_* продължават да се уважават (съвместимост с v3.x).
+ALIASES_FILE="${ALIASHUB_FILE:-${ALIASCTL_FILE:-$HOME/.fedya_aliases}}"
+BACKUP_DIR="${ALIASHUB_BACKUP_DIR:-${ALIASCTL_BACKUP_DIR:-$HOME/.config/aliashub/backups}}"
+MAX_BACKUPS="${ALIASHUB_MAX_BACKUPS:-${ALIASCTL_MAX_BACKUPS:-50}}"
+
+# ---------------------------- Цветове ---------------------------------------
+USE_COLOR=1
+[ -t 1 ] || USE_COLOR=0
+[ -n "${NO_COLOR:-}" ] && USE_COLOR=0
+
+set_color_vars() {
+    if [ "$USE_COLOR" -eq 1 ]; then
+        C_RESET=$'\033[0m';  C_BOLD=$'\033[1m';   C_DIM=$'\033[2m'
+        C_PRIMARY=$'\033[38;5;81m'   # светло синьо
+        C_SUCCESS=$'\033[38;5;82m'   # зелено
+        C_WARNING=$'\033[38;5;214m'  # оранжево
+        C_ERROR=$'\033[38;5;196m'    # червено
+        C_INFO=$'\033[38;5;147m'     # лавандула
+        C_TITLE=$'\033[38;5;213m'    # розово-лилаво
+        C_KEY=$'\033[38;5;226m'      # жълто
+        C_VAL=$'\033[38;5;153m'      # светло синьо
+        C_BORDER=$'\033[38;5;240m'   # сиво
+    else
+        C_RESET=""; C_BOLD=""; C_DIM=""
+        C_PRIMARY=""; C_SUCCESS=""; C_WARNING=""; C_ERROR=""
+        C_INFO=""; C_TITLE=""; C_KEY=""; C_VAL=""; C_BORDER=""
+    fi
+}
+set_color_vars
+
+# ------------------------- Box drawing символи ------------------------------
+BOX_TL="╭"; BOX_TR="╮"; BOX_BL="╰"; BOX_BR="╯"
+BOX_H="─";  BOX_V="│"
+
+# ------------------------- Базови помощни функции ---------------------------
+T() {
+    # T <ключ> [аргументи...] — преведено съобщение без нов ред
+    local _key="$1"; shift 2>/dev/null || true
+    local _s=""
+    # транслациите идват от msg_translate (p2_i18n.sh)
+    msg_translate "$_key"
+    _s="${T_BG:-}"; [ "$LANG_MODE" = "en" ] && _s="${T_EN:-}"
+    unset T_BG T_EN
+    if [ "$#" -gt 0 ]; then printf "$_s" "$@"; else printf '%b' "$_s"; fi
+}
+
+ok()    { printf "%b%s%b\n" "${C_SUCCESS}${C_BOLD}" "$*" "${C_RESET}"; }
+fail()  { printf "%b%s%b\n" "${C_ERROR}" "$*" "${C_RESET}" >&2; }
+warn()  { printf "%b%s%b\n" "${C_WARNING}" "$*" "${C_RESET}"; }
+info()  { printf "%b%s%b\n" "${C_INFO}" "$*" "${C_RESET}"; }
+dim()   { printf "%b%s%b\n" "${C_DIM}" "$*" "${C_RESET}"; }
+
+repeat_char() { # repeat_char <символ> <брой>
+    local _out="" _n="$2"
+    while [ "$_n" -gt 0 ]; do _out="$_out$1"; _n=$((_n - 1)); done
+    printf '%s' "$_out"
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+pad_to() { # pad_to <текст> <ширина> — подравняване по ЗНАЦИ (кирилицата е 2 байта!)
+    local _s="$1" _w="$2" _n
+    _n=$(( _w - ${#_s} ))
+    [ "$_n" -lt 0 ] && _n=0
+    printf '%s%s' "$_s" "$(repeat_char ' ' "$_n")"
+}
+
+# ------------------------- Мета: категории и тагове --------------------------
+# Метаданните са коментар-ред ТОЧНО НАД реда на алиаса (безопасен при source):
+#   # @aliashub tags=net,ssh category=server
+#   alias srv='ssh root@srv'
+META_TAG="# @aliashub "
+
+CONFIG_DIR="$HOME/.config/aliashub"
+CONFIG_FILE="$CONFIG_DIR/config"
+# Миграция от aliasctl v3.x: пренеси старата конфиг папка (в нея са backup-ите)
+if [ -d "$HOME/.config/aliasctl" ]; then
+    if [ ! -d "$CONFIG_DIR" ]; then
+        mv "$HOME/.config/aliasctl" "$CONFIG_DIR" 2>/dev/null || true
+    elif [ -d "$HOME/.config/aliasctl/backups" ]; then
+        # и двете папки съществуват — пренеси backup-ите без презапис
+        mkdir -p "$CONFIG_DIR/backups" 2>/dev/null
+        for _f in "$HOME/.config/aliasctl/backups"/aliases-*.bak; do
+            [ -e "$_f" ] || continue
+            _b="$CONFIG_DIR/backups/$(basename "$_f")"
+            [ -e "$_b" ] || mv "$_f" "$_b" 2>/dev/null
+        done
+        rmdir "$HOME/.config/aliasctl/backups" 2>/dev/null
+        rmdir "$HOME/.config/aliasctl" 2>/dev/null || true
+        unset _f _b
+    fi
+fi
+
+# Език: ALIASHUB_LANG > ALIASCTL_LANG (остаряла) > конфиг файл > LC_ALL/LC_MESSAGES/LANG > bg
+_detect_lang() {
+    local _l="${ALIASHUB_LANG:-${ALIASCTL_LANG:-}}"
+    if [ -z "$_l" ] && [ -f "$CONFIG_FILE" ]; then
+        _l="$(sed -n 's/^[[:space:]]*lang[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" 2>/dev/null | head -n 1)"
+        _l="$(lower "$(printf '%s' "$_l" | tr -d '[:space:]')")"
+    fi
+    if [ -z "$_l" ]; then
+        _l="${LC_ALL:-${LC_MESSAGES:-${LANG:-bg}}}"
+    fi
+    case "$(lower "$_l")" in
+        bg*) LANG_MODE="bg" ;;
+        en*) LANG_MODE="en" ;;
+        *)   LANG_MODE="bg" ;;
+    esac
+}
+_detect_lang
+
+# ------------------------- Работа с файла с алиаси --------------------------
+ensure_file() {
+    [ -f "$ALIASES_FILE" ] || { mkdir -p "$(dirname "$ALIASES_FILE")" 2>/dev/null; : > "$ALIASES_FILE"; }
+}
+ensure_backup_dir() { mkdir -p "$BACKUP_DIR" 2>/dev/null; }
+
+alias_lines() { grep '^alias ' "$ALIASES_FILE" 2>/dev/null || true; }
+alias_names() { alias_lines | sed 's/^alias //; s/=.*//'; }
+
+count_aliases() {
+    # ВНИМАНИЕ: без '|| echo 0' — grep -c извежда "0" и връща статус 1;
+    # старият код дублираше числото и чупеше сравнението.
+    local _n
+    _n=$(grep -c '^alias ' "$ALIASES_FILE" 2>/dev/null || true)
+    _n="${_n%%$'\n'*}"
+    [ -z "$_n" ] && _n=0
+    printf '%s' "$_n"
+}
+
+# Точно съвпадение по префикс "alias <име>=" — без regex, без инжекции.
+# ВАЖНО: VAR=val awk ... (префикс-присвояване) -> стойността влиза в ENVIRON
+# без обработка на escape последователности (за разлика от -v).
+awk_get_line() { # <име> -> редът или нищо
+    [ -f "$ALIASES_FILE" ] || return 0
+    A_PREFIX="alias $1=" awk 'index($0, ENVIRON["A_PREFIX"]) == 1 { print; exit }' \
+        "$ALIASES_FILE" 2>/dev/null
+}
+
+awk_remove_alias() { # <име> — изтрива точно реда на този алиас + метареда над него
+    local _tmp _aln _mln=0 _prev
+    _aln="$(A_PREFIX="alias $1=" awk 'index($0, ENVIRON["A_PREFIX"]) == 1 { print NR; exit }' \
+        "$ALIASES_FILE" 2>/dev/null)"
+    [ -n "$_aln" ] || return 0
+    if [ "$_aln" -gt 1 ]; then
+        _prev="$(sed -n "$((_aln - 1))p" "$ALIASES_FILE" 2>/dev/null)"
+        case "$_prev" in
+            "$META_TAG"*) _mln=$((_aln - 1)) ;;
+        esac
+    fi
+    _tmp="$(mktemp)" || return 1
+    A_MLN="$_mln" A_ALN="$_aln" awk '
+        NR == ENVIRON["A_MLN"] { next }
+        NR == ENVIRON["A_ALN"] { next }
+        { print }
+    ' "$ALIASES_FILE" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    mv "$_tmp" "$ALIASES_FILE"
+}
+
+awk_replace_line() { # <стар_ред> <нов_ред> — точно заместване на цял ред
+    local _tmp
+    _tmp="$(mktemp)" || return 1
+    A_OLD="$1" A_NEW="$2" awk \
+        '$0 == ENVIRON["A_OLD"] { print ENVIRON["A_NEW"]; next } { print }' \
+        "$ALIASES_FILE" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    mv "$_tmp" "$ALIASES_FILE"
+}
+
+awk_replace_prefix() { # <старо_име> <ново_име> — преименуване, пази стойността
+    local _tmp
+    _tmp="$(mktemp)" || return 1
+    A_OLDP="alias $1=" A_NEW="$2" awk '
+        index($0, ENVIRON["A_OLDP"]) == 1 {
+            print "alias " ENVIRON["A_NEW"] "=" substr($0, length(ENVIRON["A_OLDP"]) + 1)
+            next
+        }
+        { print }
+    ' "$ALIASES_FILE" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    mv "$_tmp" "$ALIASES_FILE"
+}
+
+# ------------------------- Кавички (Bash + Zsh safe) ------------------------
+sq() { # sq <текст> -> безопасно цитиран в единични кавички
+    local _s="$1"
+    _s="${_s//\'/\'\\\'\'}"
+    printf "'%s'" "$_s"
+}
+
+unquote() { # обратна операция — само за показване
+    local _v="$1"
+    case "$_v" in
+        "'"*"'")
+            _v="${_v#\'}"
+            _v="${_v%\'}"
+            _v="${_v//\'\\\'\'/\'}"
+            ;;
+    esac
+    printf '%s' "$_v"
+}
+
+# ------------------------- Валидация ----------------------------------------
+is_valid_name() {
+    # Правило на Bash за имена на алиаси: позволена е почти всяка буква —
+    # ВКЛЮЧИТЕЛНО кирилица (alias списък=...) и точки (alias ..='cd ..').
+    # Забраняваме само знаците, които чупят реда или разкриването:
+    # интервали, кавички, $, `, =, &, ;, /, ( ), { }, [ ], |, *, ?, !, #, \\, <, >
+    # и тире в началото (обърква се с опция на builtin 'alias').
+    local _n="$1" _i _ch _len
+    [ -n "$_n" ] || return 1
+    case "${_n%"${_n#?}"}" in
+        -) return 1 ;;
+    esac
+    _len=${#_n}
+    for (( _i = 0; _i < _len; _i++ )); do
+        _ch="${_n:_i:1}"
+        case "$_ch" in
+            [[:space:]]|\'|\"|\$|\`|\=|\&|\;|/|\(|\)|\{|\}|\[|\]|\||\*|\?|\!|\#|\\|\<|\>) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+name_conflict() { # заето ли е от команда/вградена команда
+    command -v "$1" >/dev/null 2>&1
+}
+
+find_same_cmd() { # връща име на алиас със същата команда (или нищо)
+    alias_lines | while IFS= read -r _line; do
+        _n="${_line#alias }"; _v="${_line#*=}"
+        _n="${_n%%=*}"
+        if [ "$(unquote "$_v")" = "$1" ]; then printf '%s' "$_n"; return 0; fi
+    done
+    return 0
+}
+
+# ------------------------- Backup система -----------------------------------
+prune_backups() {
+    [ -d "$BACKUP_DIR" ] || return 0
+    ls -1t "$BACKUP_DIR"/aliases-*.bak 2>/dev/null \
+        | tail -n +$((MAX_BACKUPS + 1)) \
+        | while IFS= read -r _old; do rm -f -- "$_old"; done
+    return 0
+}
+
+make_backup() { # извежда пътя до новия backup (или нищо, ако няма файл)
+    [ -f "$ALIASES_FILE" ] || return 0
+    ensure_backup_dir
+    local _f _stamp _c=1
+    _stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null || date +%s)"
+    _f="$BACKUP_DIR/aliases-$_stamp.bak"
+    # втори backup в същата секунда -> уникален суфикс (без презапис!)
+    if [ -e "$_f" ]; then
+        while [ -e "$BACKUP_DIR/aliases-$_stamp-$_c.bak" ]; do _c=$((_c + 1)); done
+        _f="$BACKUP_DIR/aliases-$_stamp-$_c.bak"
+    fi
+    cp -p "$ALIASES_FILE" "$_f" 2>/dev/null || return 1
+    prune_backups
+    printf '%s' "$_f"
+}
+
+list_backups() { ls -1t "$BACKUP_DIR"/aliases-*.bak 2>/dev/null || true; }
+
+# ------------------------- Интеракция ---------------------------------------
+pause() {
+    printf "%b%s%b" "${C_DIM}" "$(T gen.continue)" "${C_RESET}"
+    read -r _ || true
+    printf '\n'
+}
+
+confirm() { # confirm <ключ> [аргументи...] -> 0 = да
+    local _ans
+    printf "%b%s %b" "${C_WARNING}" "$(T "$@")" "${C_RESET}"
+    read -r _ans || return 1
+    case "$_ans" in
+        д|Д|y|Y|да|Да|YES|Yes|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+pick_editor() {
+    local _c
+    for _c in "${VISUAL:-}" "${EDITOR:-}" nano vim vi; do
+        [ -n "$_c" ] || continue
+        if command -v "$_c" >/dev/null 2>&1; then EDITOR_CMD="$_c"; return 0; fi
+    done
+    EDITOR_CMD="vi"
+}
+# ============================================================================
+#  p2 — i18n: msg_translate <ключ>  (дефинира T_BG и T_EN)
+# ============================================================================
+msg_translate() {
+    case "$1" in
+        # ---- общи ----
+        gen.continue)     T_BG="Натисни Enter за продължаване...";            T_EN="Press Enter to continue..." ;;
+        gen.cancelled)    T_BG="· Отказано";                                   T_EN="· Cancelled" ;;
+        gen.none)         T_BG="Няма дефинирани алиаси";                       T_EN="No aliases defined" ;;
+        gen.total)        T_BG="Общо алиаси";                                  T_EN="Total aliases" ;;
+        gen.file)         T_BG="Файл";                                         T_EN="File" ;;
+        gen.editor)       T_BG="Редактор";                                     T_EN="Editor" ;;
+        gen.reload)       T_BG="· За да влязат в сила в текущия терминал: source %s"; T_EN="· To apply in the current terminal: source %s" ;;
+        gen.aliases_word) T_BG="алиаси";                                       T_EN="aliases" ;;
+        # ---- грешки ----
+        err.empty_name)   T_BG="Името не може да бъде празно!";                T_EN="Name cannot be empty!" ;;
+        err.empty_cmd)    T_BG="Командата не може да бъде празна!";            T_EN="Command cannot be empty!" ;;
+        err.bad_name)     T_BG="Невалидно име: '%s'  (позволени: букви вкл. кирилица, цифри, . _ - + :, без интервали и кавички)"; T_EN="Invalid name: '%s'  (allowed: letters incl. Cyrillic, digits, . _ - + :, no spaces or quotes)" ;;
+        err.exists)       T_BG="Алиас '%s' вече съществува!";                  T_EN="Alias '%s' already exists!" ;;
+        err.not_found)    T_BG="Алиас '%s' не съществува!";                    T_EN="Alias '%s' does not exist!" ;;
+        err.conflict)     T_BG="Внимание: '%s' вече е заето от команда. Алиасът ще го засенчи. Продължаваш? (д/н)"; T_EN="Warning: '%s' is already taken by a command. The alias will shadow it. Continue? (y/n)" ;;
+        err.invalid_choice) T_BG="Невалидна опция!";                           T_EN="Invalid option!" ;;
+        err.fzf_missing)  T_BG="fzf не е инсталиран!";                         T_EN="fzf is not installed!" ;;
+        err.fzf_hint)     T_BG="Инсталирай с: %s";                             T_EN="Install with: %s" ;;
+        err.write_fail)   T_BG="Файлът не можа да бъде записан: %s";           T_EN="Could not write file: %s" ;;
+        err.unknown_cmd)  T_BG="Непозната команда: %s (виж: aliashub help)";   T_EN="Unknown command: %s (see: aliashub help)" ;;
+        err.missing_args) T_BG="Липсват аргументи. Виж: aliashub help %s";     T_EN="Missing arguments. See: aliashub help %s" ;;
+        err.no_backups)   T_BG="Още няма backup файлове.";                     T_EN="No backups yet." ;;
+        err.conflict_short) T_BG="Внимание: '%s' засенчва съществуваща команда."; T_EN="Warning: '%s' shadows an existing command." ;;
+        fe.open)          T_BG="Отваряне на %s в %s ...";                      T_EN="Opening %s in %s ..." ;;
+        # ---- заглавия на екрани ----
+        app.title)        T_BG="🎨 ALIASHUB v4.0 · Алиас мениджърът на Федя";   T_EN="🎨 ALIASHUB v4.0 · Fedya's Alias Manager" ;;
+        t.tags)           T_BG="🏷️  Категории и тагове";                       T_EN="🏷️  Categories & tags" ;;
+        t.list)           T_BG="📋 Преглед на алиасите";                       T_EN="📋 View aliases" ;;
+        t.add)            T_BG="➕ Добавяне на нов алиас";                     T_EN="➕ Add a new alias" ;;
+        t.rm)             T_BG="🗑️  Премахване на алиас";                     T_EN="🗑️  Remove an alias" ;;
+        t.edit)           T_BG="✏️  Редакция на алиас";                       T_EN="✏️  Edit an alias" ;;
+        t.search)         T_BG="🔍 Търсене";                                   T_EN="🔍 Search" ;;
+        t.file)           T_BG="📝 Редактиране на файла";                      T_EN="📝 Editing the file" ;;
+        t.backup)         T_BG="💾 Backup и възстановяване";                  T_EN="💾 Backup & restore" ;;
+        t.check)          T_BG="🔧 Проверка на файла";                         T_EN="🔧 File check" ;;
+        t.doctor)         T_BG="🩺 Диагностика";                               T_EN="🩺 Doctor" ;;
+        t.help)           T_BG="📖 Помощ";                                     T_EN="📖 Help" ;;
+        t.stats)          T_BG="📊 Статистика";                                T_EN="📊 Stats" ;;
+        t.init)           T_BG="🚀 Интеграция със шел";                        T_EN="🚀 Shell integration" ;;
+        # ---- менюто ----
+        menu.prompt)      T_BG="Избери опция";                                 T_EN="Choose an option" ;;
+        menu.m1)          T_BG="Преглед на всички алиаси";                     T_EN="View all aliases" ;;
+        menu.m2)          T_BG="Добавяне на нов алиас";                        T_EN="Add a new alias" ;;
+        menu.m3)          T_BG="Търсене";                                      T_EN="Search" ;;
+        menu.m4)          T_BG="Редакция на алиас";                            T_EN="Edit an alias" ;;
+        menu.m5)          T_BG="Премахване на алиас";                          T_EN="Remove an alias" ;;
+        menu.m6)          T_BG="Редактиране на файла (EDITOR)";                T_EN="Edit the file (EDITOR)" ;;
+        menu.m7)          T_BG="Backup и възстановяване";                      T_EN="Backup & restore" ;;
+        menu.m8)          T_BG="Проверка и диагностика";                       T_EN="Check & doctor" ;;
+        menu.m9)          T_BG="Помощ";                                        T_EN="Help" ;;
+        menu.m10)         T_BG="Категории и тагове";                           T_EN="Categories & tags" ;;
+        menu.m11)         T_BG="Език (bg/en)";                                 T_EN="Language (bg/en)" ;;
+        list.col_meta)    T_BG="КАТЕГОРИЯ · ТАГОВЕ";                           T_EN="CATEGORY · TAGS" ;;
+        menu.quit)        T_BG="Изход";                                        T_EN="Quit" ;;
+        # ---- списък ----
+        list.col_name)    T_BG="ИМЕ";                                          T_EN="NAME" ;;
+        list.col_cmd)     T_BG="КОМАНДА";                                      T_EN="COMMAND" ;;
+        # ---- добавяне ----
+        add.ask_name)     T_BG="Име на алиаса";                                T_EN="Alias name" ;;
+        add.ask_cmd)      T_BG="Команда";                                      T_EN="Command" ;;
+        add.ok)           T_BG="✅ Успешно добавен: %s";                       T_EN="✅ Successfully added: %s" ;;
+        add.same_cmd)     T_BG="· Същата команда вече съществува като '%s'";   T_EN="· Same command already exists as '%s'" ;;
+        # ---- премахване ----
+        rm.ask)           T_BG="Име на алиаса за премахване";                  T_EN="Alias name to remove" ;;
+        rm.confirm)       T_BG="Сигурен ли си? Ще изтриеш '%s' (д/н)";        T_EN="Are you sure? Delete '%s' (y/n)" ;;
+        rm.ok)            T_BG="✅ Премахнат: %s";                             T_EN="✅ Removed: %s" ;;
+        rm.none)          T_BG="Няма алиаси за премахване.";                   T_EN="No aliases to remove." ;;
+        # ---- редакция ----
+        ed.ask)           T_BG="Име на алиаса (Enter = избор от списък)";      T_EN="Alias name (Enter = pick from list)" ;;
+        ed.pick_num)      T_BG="Номер на алиас";                               T_EN="Alias number" ;;
+        ed.new_cmd)       T_BG="Нова команда";                                 T_EN="New command" ;;
+        ed.new_name)      T_BG="Ново име";                                     T_EN="New name" ;;
+        ed.ok_cmd)        T_BG="✅ Обновена команда: %s";                      T_EN="✅ Command updated: %s" ;;
+        ed.ok_name)       T_BG="✅ Преименуван: %s → %s";                      T_EN="✅ Renamed: %s → %s" ;;
+        ed.bad_pick)      T_BG="Невалиден избор.";                             T_EN="Invalid selection." ;;
+        ed.m1)            T_BG="Промяна на командата";                         T_EN="Change the command" ;;
+        ed.m2)            T_BG="Преименуване";                                 T_EN="Rename" ;;
+        ed.m3)            T_BG="Тагове";                                       T_EN="Tags" ;;
+        ed.m4)            T_BG="Категория";                                    T_EN="Category" ;;
+        ed.m5)            T_BG="Назад";                                        T_EN="Back" ;;
+        ed.m6)            T_BG="Категория (Enter = без промяна)";              T_EN="Category (Enter = keep)" ;;
+        ed.m7)            T_BG="Тагове (запетаи; Enter = без промяна)";        T_EN="Tags (comma-separated; Enter = keep)" ;;
+        ed.m8)            T_BG="· Без промяна";                                T_EN="· Unchanged" ;;
+        add.ask_cat)      T_BG="Категория (Enter = без)";                      T_EN="Category (Enter = none)" ;;
+        add.ask_tags)     T_BG="Тагове, разделени със запетая (Enter = без)";  T_EN="Comma-separated tags (Enter = none)" ;;
+        # ---- търсене ----
+        se.ask)           T_BG="Търси";                                        T_EN="Search for" ;;
+        se.none)          T_BG="Няма съвпадения за '%s'";                      T_EN="No matches for '%s'" ;;
+        se.found)         T_BG="Намерени: %s";                                 T_EN="Found: %s" ;;
+        # ---- fzf ----
+        fz.actions)       T_BG="[1] Редакция · [2] Изтриване · [Enter] Назад"; T_EN="[1] Edit · [2] Delete · [Enter] Back" ;;
+        fz.selected)      T_BG="Избран алиас";                                 T_EN="Selected alias" ;;
+        # ---- backup ----
+        bk.ok)            T_BG="✅ Backup създаден: %s";                       T_EN="✅ Backup created: %s" ;;
+        bk.header)        T_BG="Налични backup-и (най-новите първи)";          T_EN="Available backups (newest first)" ;;
+        bk.pick)          T_BG="Номер на backup за възстановяване";            T_EN="Backup number to restore" ;;
+        bk.confirm)       T_BG="Възстановяване от %s? Текущият файл ще бъде архивиран. (д/н)"; T_EN="Restore from %s? Current file will be backed up. (y/n)" ;;
+        bk.ok_restore)    T_BG="✅ Възстановено от: %s";                       T_EN="✅ Restored from: %s" ;;
+        bk.m1)            T_BG="Създай backup сега";                           T_EN="Create a backup now" ;;
+        bk.m2)            T_BG="Списък с backup-и";                            T_EN="List backups" ;;
+        bk.m3)            T_BG="Възстанови от backup";                         T_EN="Restore from backup" ;;
+        bk.m4)            T_BG="Назад";                                        T_EN="Back" ;;
+        # ---- проверка на файла ----
+        ck.ok)            T_BG="Всичко изглежда наред — %s алиаса.";           T_EN="Everything looks good — %s aliases." ;;
+        ck.line_bad)      T_BG="Ред %s: неразпознат синтаксис: %s";            T_EN="Line %s: unrecognized syntax: %s" ;;
+        ck.name_bad)      T_BG="Ред %s: невалидно име '%s'";                   T_EN="Line %s: invalid name '%s'" ;;
+        ck.empty_cmd)     T_BG="Ред %s: празна команда";                       T_EN="Line %s: empty command" ;;
+        ck.dup)           T_BG="Дубликат: '%s'";                               T_EN="Duplicate: '%s'" ;;
+        ck.issues)        T_BG="Намерени проблеми: %s";                        T_EN="Issues found: %s" ;;
+        ck.syntax)        T_BG="Синтактична грешка (bash -n): %s";             T_EN="Syntax error (bash -n): %s" ;;
+        ck.unquoted)      T_BG="Ред %s: стойността съдържа интервал, но не е в кавички: %s"; T_EN="Line %s: value contains a space but is not quoted: %s" ;;
+        ck.meta_bad)      T_BG="Ред %s: невалидни метаданни (очаква се 'tags=… category=…'): %s"; T_EN="Line %s: invalid metadata (expected 'tags=… category=…'): %s" ;;
+        ck.no_eq)         T_BG="Ред %s: 'alias' без '=': %s";                  T_EN="Line %s: 'alias' without '=': %s" ;;
+        ck.funcs)         T_BG="Функции и друг shell код (не се пипат от aliashub)"; T_EN="Functions and other shell code (not managed by aliashub)" ;;
+        # ---- филтри / групиране ----
+        flt.tag)          T_BG="филтър таг: %s";                               T_EN="tag filter: %s" ;;
+        flt.cat)          T_BG="филтър категория: %s";                         T_EN="category filter: %s" ;;
+        flt.none)         T_BG="Няма алиаси, отговарящи на филтъра";           T_EN="No aliases match the filter" ;;
+        grp.uncat)        T_BG="без категория";                                T_EN="uncategorized" ;;
+        # ---- тагове и категории (CLI + меню) ----
+        tag.current)      T_BG="Тагове на '%s': %s";                           T_EN="Tags of '%s': %s" ;;
+        tag.none)         T_BG="'%s' няма тагове";                             T_EN="'%s' has no tags" ;;
+        tag.ok)           T_BG="✅ Тагове на '%s': %s";                        T_EN="✅ Tags of '%s': %s" ;;
+        tag.cleared)      T_BG="✅ Таговете са изчистени";                     T_EN="✅ Tags cleared" ;;
+        tag.bad)          T_BG="Невалидни тагове (без интервали): '%s'";       T_EN="Invalid tags (no spaces allowed): '%s'" ;;
+        cat.current)      T_BG="Категория на '%s': %s";                        T_EN="Category of '%s': %s" ;;
+        cat.none)         T_BG="'%s' няма категория";                          T_EN="'%s' has no category" ;;
+        cat.ok)           T_BG="✅ Категория на '%s': %s";                     T_EN="✅ Category of '%s': %s" ;;
+        cat.cleared)      T_BG="✅ Категорията е изчистена";                   T_EN="✅ Category cleared" ;;
+        cat.bad)          T_BG="Категорията не може да съдържа интервали или запетаи: '%s'"; T_EN="Category cannot contain spaces or commas: '%s'" ;;
+        cs.empty)         T_BG="Все още няма категории и тагове. Задай с: aliashub tag ИМЕ tag1,tag2"; T_EN="No categories/tags yet. Set with: aliashub tag NAME tag1,tag2" ;;
+        cs.tags_line)     T_BG="Тагове";                                       T_EN="Tags" ;;
+        cs.hint)          T_BG="Номер = категория · текст = таг · Enter = назад"; T_EN="number = category · text = tag · Enter = back" ;;
+        cs.pick_cat)      T_BG="Номер на категория или таг";                   T_EN="Category number or tag name" ;;
+        cs.act_edit)      T_BG="Редакция";                                     T_EN="Edit" ;;
+        cs.act_tag)       T_BG="Тагове";                                       T_EN="Tags" ;;
+        cs.act_cat)       T_BG="Категория";                                    T_EN="Category" ;;
+        cs.act_rm)        T_BG="Изтриване";                                    T_EN="Delete" ;;
+        cs.act_back)      T_BG="Назад";                                        T_EN="Back" ;;
+        # ---- език ----
+        lg.current)       T_BG="Език: %s";                                     T_EN="Language: %s" ;;
+        lg.hint)          T_BG="Смяна: aliashub lang bg|en — запазва се трайно в ~/.config/aliashub/config"; T_EN="Change: aliashub lang bg|en — saved permanently to ~/.config/aliashub/config" ;;
+        lg.usage)         T_BG="Употреба: aliashub lang bg|en";                T_EN="Usage: aliashub lang bg|en" ;;
+        lg.ask)           T_BG="Език / Language (bg|en)";                      T_EN="Language / Език (bg|en)" ;;
+        lg.saved)         T_BG="✅ Езикът е запазен в %s";                     T_EN="✅ Language saved to %s" ;;
+        lg.cfg_fail)      T_BG="⚠ Не можах да запиша конфига — езикът е сменен само за тази сесия"; T_EN="⚠ Could not save config — language changed for this session only" ;;
+        # ---- диагностика ----
+        dr.mark_ok)       T_BG="✓";                                            T_EN="✓" ;;
+        dr.mark_bad)      T_BG="✗";                                            T_EN="✗" ;;
+        dr.file)          T_BG="Файл с алиаси";                                T_EN="Aliases file" ;;
+        dr.file_missing)  T_BG="липсва (ще се създаде при първа промяна)";     T_EN="missing (will be created on first change)" ;;
+        dr.rc_bash)       T_BG="Зареждане в ~/.bashrc";                        T_EN="Sourced in ~/.bashrc" ;;
+        dr.rc_zsh)        T_BG="Зареждане в ~/.zshrc";                         T_EN="Sourced in ~/.zshrc" ;;
+        dr.editor)        T_BG="Редактор";                                     T_EN="Editor" ;;
+        dr.fzf)           T_BG="fzf (търсене, опционално)";                    T_EN="fzf (search, optional)" ;;
+        dr.backups)       T_BG="Backup папка";                                 T_EN="Backup folder" ;;
+        dr.not_set)       T_BG="не е намерен";                                 T_EN="not found" ;;
+        dr.hint_init)     T_BG="Съвет: 'aliashub init' настройва автоматичното зареждане."; T_EN="Tip: 'aliashub init' sets up auto-loading." ;;
+        dr.lang)          T_BG="Език на интерфейса";                           T_EN="Interface language" ;;
+        dr.file_syntax)   T_BG="Синтаксис и съдържание на файла";              T_EN="File syntax and content" ;;
+        dr.ck_issues)     T_BG="%s проблема — виж: aliashub check";            T_EN="%s issue(s) — see: aliashub check" ;;
+        dr.all_ok)        T_BG="Всичко е наред! 🎉";                           T_EN="All good! 🎉" ;;
+        dr.issues)        T_BG="Открити проблеми: %s — виж подсказките по-горе."; T_EN="Issues found: %s — see the hints above." ;;
+        # ---- init ----
+        in.added)         T_BG="✅ Добавено в %s";                             T_EN="✅ Added to %s" ;;
+        in.present)       T_BG="· Вече има блок за aliashub в %s";             T_EN="· aliashub block already present in %s" ;;
+        in.upgraded)      T_BG="✅ Старият aliasctl блок в %s е надграден до aliashub"; T_EN="✅ Old aliasctl block in %s upgraded to aliashub" ;;
+        in.created)       T_BG="✅ Създаден нов %s";                           T_EN="✅ Created new %s" ;;
+        in.skip_zsh)      T_BG="· Пропуснат ~/.zshrc (zsh не е инсталиран)";   T_EN="· Skipped ~/.zshrc (zsh not installed)" ;;
+        # ---- статистика ----
+        st.count)         T_BG="Брой алиаси";                                  T_EN="Alias count" ;;
+        st.size)          T_BG="Размер на файла";                              T_EN="File size" ;;
+        st.modified)      T_BG="Последна промяна";                             T_EN="Last modified" ;;
+        st.last_backup)   T_BG="Последен backup";                              T_EN="Last backup" ;;
+        st.never)         T_BG="никога";                                       T_EN="never" ;;
+        st.by_cat)        T_BG="По категории";                                 T_EN="By category" ;;
+        st.tagged)        T_BG="С тагове";                                     T_EN="Tagged" ;;
+        # ---- изход / помощ ----
+        gb.bye)           T_BG="👋 Довиждане!";                                T_EN="👋 Goodbye!" ;;
+        hp.sourced)       T_BG="За да заредиш алиасите:";                      T_EN="To load the aliases:" ;;
+        hp.bashrc)        T_BG="или добави автоматичното зареждане в ~/.bashrc (и в ~/.zshrc за Zsh):"; T_EN="or add auto-loading to ~/.bashrc (and ~/.zshrc for Zsh):" ;;
+        hp.autoload)      T_BG="Съвет: 'aliashub init' го прави автоматично."; T_EN="Tip: 'aliashub init' does it automatically." ;;
+        hp.cli)           T_BG="CLI режим — примери:";                         T_EN="CLI mode — examples:" ;;
+        hp.site)          T_BG="Посети сайта ми за още полезни неща:";         T_EN="Visit my site for more useful stuff:" ;;
+        hp.env)           T_BG="Настройки чрез променливи на средата:";        T_EN="Configuration via environment variables:" ;;
+        *) T_BG=""; T_EN="" ;;
+    esac
+}
+# ============================================================================
+#  p3 — операции: вход, записи, основни мутации, backup, fzf
+# ============================================================================
+ALIASHUB_INTERACTIVE="${ALIASHUB_INTERACTIVE:-0}"
+_IN=""
+_US=$'\x1f'   # разделител за полета в записите (никога не се среща в команди)
+
+# ------------------------------ вход ----------------------------------------
+ask_input() { # ask_input <подканващ текст> [стойност по подразбиране] -> $_IN
+    local _p="$1" _def="${2:-}"
+    _IN=""
+    if [ -n "$_def" ] && [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; then
+        read -e -r -i "$_def" -p "$(printf '%b%s%b ' "$C_INFO" "$_p" "$C_RESET")" _IN || return 1
+    else
+        printf "%b%s%b " "$C_INFO" "$_p" "$C_RESET"
+        [ -n "$_def" ] && printf "%b[%s]%b " "$C_DIM" "$_def" "$C_RESET"
+        read -r _IN || return 1
+        [ -z "$_IN" ] && _IN="$_def"
+    fi
+    return 0
+}
+
+# ------------------------------ записи ---------------------------------------
+# alias_entries чете файла и извежда: име<US>стойност<US>тагове<US>категория
+# (мета-коментарът '# @aliashub ...' точно над алиаса се прикрепя към него)
+alias_entries() {
+    local _line _meta="" _name _val _p _tags _cat
+    [ -f "$ALIASES_FILE" ] || return 0
+    while IFS= read -r _line; do
+        case "$_line" in
+            "$META_TAG"*) _meta="${_line#"$META_TAG"}"; continue ;;
+            "alias "*) ;;
+            *) continue ;;
+        esac
+        _tags=""; _cat=""
+        for _p in $_meta; do
+            case "$_p" in
+                tags=*)     _tags="${_p#tags=}" ;;
+                category=*) _cat="${_p#category=}" ;;
+            esac
+        done
+        _name="${_line#alias }"; _val="${_name#*=}"; _name="${_name%%=*}"
+        printf '%s%s%s%s%s%s%s\n' "$_name" "$_US" "$_val" "$_US" "$_tags" "$_US" "$_cat"
+        _meta=""
+    done < "$ALIASES_FILE"
+}
+
+print_entry_row() { # <име> <стойност> <тагове> <категория>
+    local _name="$1" _val="$2" _tags="$3" _cat="$4"
+    _val="$(unquote "$_val")"
+    local _meta=""
+    [ -n "$_cat" ] && _meta="$_cat"
+    if [ -n "$_tags" ]; then
+        [ -n "$_meta" ] && _meta="$_meta · "
+        _meta="$_meta$_tags"
+    fi
+    local _cw=45
+    [ -n "$_meta" ] && _cw=28
+    if [ "${#_val}" -gt "$_cw" ]; then _val="${_val:0:$((_cw - 3))}..."; fi
+    printf "  %b%s%b %b→%b %b%s%b" \
+        "$C_KEY" "$(pad_to "$_name" 18)" "$C_RESET" "$C_BORDER" "$C_RESET" "$C_VAL" "$_val" "$C_RESET"
+    if [ -n "$_meta" ]; then
+        printf " %b· %s%b" "$C_INFO" "$_meta" "$C_RESET"
+    fi
+    printf '\n'
+}
+
+render_entries_stdin() { # чете име<US>стойност<US>тагове<US>категория от stdin
+    local _line
+    printf "%b%s   %s%b\n" "$C_BORDER$C_DIM" \
+        "$(pad_to "$(T list.col_name)" 20)" "$(T list.col_cmd)" "$C_RESET"
+    dim "$(repeat_char "$BOX_H" "$HEADER_WIDTH")"
+    while IFS= read -r _line; do
+        [ -n "$_line" ] || continue
+        local _rest _name _val _tg _ct
+        _name="${_line%%"$_US"*}"
+        _rest="${_line#*"$_US"}"
+        _val="${_rest%%"$_US"*}"
+        _rest="${_rest#*"$_US"}"
+        _tg="${_rest%%"$_US"*}"
+        _ct="${_rest#*"$_US"}"
+        print_entry_row "$_name" "$_val" "$_tg" "$_ct"
+    done
+}
+
+# ------------------------------ показване -----------------------------------
+show_alias() { # show_alias <име>
+    local _line _name _val _tg _ct _meta
+    _line="$(awk_get_line "$1")"
+    [ -n "$_line" ] || { fail "$(T err.not_found "$1")"; return 1; }
+    _name="${_line#alias }"; _val="${_name#*=}"; _name="${_name%%=*}"
+    printf "%b%s%b = %b%s%b\n" "$C_KEY$C_BOLD" "$_name" "$C_RESET" "$C_VAL" "$(unquote "$_val")" "$C_RESET"
+    dim "  $_line"
+    _tg="$(meta_get_tags "$1")"
+    _ct="$(meta_get_cat "$1")"
+    _meta=""
+    [ -n "$_ct" ] && _meta="$_ct"
+    if [ -n "$_tg" ]; then
+        [ -n "$_meta" ] && _meta="$_meta · "
+        _meta="$_meta$_tg"
+    fi
+    [ -n "$_meta" ] && info "  · $_meta"
+    return 0
+}
+
+# ------------------------------ ядро: мутации -------------------------------
+# Връщат 0 при успех; съобщението за грешка вече е изведено.
+# В интерактивен режим (ALIASHUB_INTERACTIVE=1) питат за потвърждение.
+
+core_add() { # <име> <команда> [тагове] [категория]
+    local _name="$1" _cmd="$2" _tags="${3:-}" _cat="${4:-}" _dupe _meta
+    is_valid_name "$_name" || { fail "$(T err.bad_name "$_name")"; return 1; }
+    [ -n "$_cmd" ] || { fail "$(T err.empty_cmd)"; return 1; }
+    case "$_cat" in *[[:space:],]*) fail "$(T cat.bad "$_cat")"; return 1 ;; esac
+    case "$_tags" in *[[:space:]]*) fail "$(T tag.bad "$_tags")"; return 1 ;; esac
+    _meta="$(meta_format "$_tags" "$_cat")"
+    ensure_file
+    if [ -n "$(awk_get_line "$_name")" ]; then
+        fail "$(T err.exists "$_name")"; return 1
+    fi
+    if name_conflict "$_name"; then
+        if [ "$ALIASHUB_INTERACTIVE" = "1" ]; then
+            printf '\n'
+            confirm err.conflict "$_name" || { info "$(T gen.cancelled)"; return 1; }
+        else
+            warn "$(T err.conflict_short "$_name")"
+        fi
+    fi
+    _dupe="$(find_same_cmd "$_cmd")"
+    if [ -n "$_dupe" ] && [ "$_dupe" != "$_name" ]; then
+        info "$(T add.same_cmd "$_dupe")"
+    fi
+    make_backup >/dev/null || true
+    {
+        [ -n "$_meta" ] && printf '%s%s\n' "$META_TAG" "$_meta"
+        printf 'alias %s=%s\n' "$_name" "$(sq "$_cmd")"
+    } >> "$ALIASES_FILE" || { fail "$(T err.write_fail "$ALIASES_FILE")"; return 1; }
+    return 0
+}
+
+core_remove() { # <име>
+    local _name="$1"
+    ensure_file
+    if [ -z "$(awk_get_line "$_name")" ]; then
+        fail "$(T err.not_found "$_name")"; return 1
+    fi
+    if [ "$ALIASHUB_INTERACTIVE" = "1" ]; then
+        confirm rm.confirm "$_name" || { info "$(T gen.cancelled)"; return 1; }
+    fi
+    make_backup >/dev/null || true
+    awk_remove_alias "$_name" || { fail "$(T err.write_fail "$ALIASES_FILE")"; return 1; }
+    return 0
+}
+
+core_setcmd() { # <име> <нова команда>
+    local _name="$1" _cmd="$2" _old _new
+    ensure_file
+    [ -n "$_cmd" ] || { fail "$(T err.empty_cmd)"; return 1; }
+    _old="$(awk_get_line "$_name")"
+    [ -n "$_old" ] || { fail "$(T err.not_found "$_name")"; return 1; }
+    _new="$(printf 'alias %s=%s' "$_name" "$(sq "$_cmd")")"
+    [ "$_old" = "$_new" ] && return 0
+    make_backup >/dev/null || true
+    awk_replace_line "$_old" "$_new" || { fail "$(T err.write_fail "$ALIASES_FILE")"; return 1; }
+    return 0
+}
+
+core_rename() { # <старо_име> <ново_име> — метаредът остава прикрепен над реда
+    local _old="$1" _new="$2"
+    ensure_file
+    [ -n "$(awk_get_line "$_old")" ] || { fail "$(T err.not_found "$_old")"; return 1; }
+    is_valid_name "$_new" || { fail "$(T err.bad_name "$_new")"; return 1; }
+    if [ -n "$(awk_get_line "$_new")" ]; then
+        fail "$(T err.exists "$_new")"; return 1
+    fi
+    make_backup >/dev/null || true
+    awk_replace_prefix "$_old" "$_new" || { fail "$(T err.write_fail "$ALIASES_FILE")"; return 1; }
+    return 0
+}
+
+# ------------------------------ CLI команди ---------------------------------
+cmd_add() { # add ИМЕ КОМАНДА... [--tags a,b] [--category c]
+    local _tags="" _cat="" _pos=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --tags)       [ -n "${2:-}" ] || { fail "$(T err.missing_args --tags)"; return 2; }; _tags="$2"; shift ;;
+            --tags=*)     _tags="${1#*=}" ;;
+            --category)   [ -n "${2:-}" ] || { fail "$(T err.missing_args --category)"; return 2; }; _cat="$2"; shift ;;
+            --category=*) _cat="${1#*=}" ;;
+            --cat)        [ -n "${2:-}" ] || { fail "$(T err.missing_args --cat)"; return 2; }; _cat="$2"; shift ;;
+            --cat=*)      _cat="${1#*=}" ;;
+            *)            _pos+=("$1") ;;
+        esac
+        shift
+    done
+    [ "${#_pos[@]}" -ge 2 ] || { fail "$(T err.missing_args add)"; return 2; }
+    local _name="${_pos[0]}"
+    local _cmd="${_pos[*]:1}"
+    if core_add "$_name" "$_cmd" "$_tags" "$_cat"; then
+        ok "$(T add.ok "$_name")"
+        dim "$(T gen.reload "$ALIASES_FILE")"
+    else
+        return 1
+    fi
+}
+
+cmd_rm() {
+    [ "$#" -ge 1 ] || { fail "$(T err.missing_args rm)"; return 2; }
+    if core_remove "$1"; then
+        ok "$(T rm.ok "$1")"
+        dim "$(T gen.reload "$ALIASES_FILE")"
+    else
+        return 1
+    fi
+}
+
+cmd_rename() {
+    [ "$#" -ge 2 ] || { fail "$(T err.missing_args rename)"; return 2; }
+    if core_rename "$1" "$2"; then
+        ok "$(T ed.ok_name "$1" "$2")"
+        dim "$(T gen.reload "$ALIASES_FILE")"
+    else
+        return 1
+    fi
+}
+
+cmd_setcmd() {
+    [ "$#" -ge 2 ] || { fail "$(T err.missing_args setcmd)"; return 2; }
+    local _name="$1"; shift
+    local _cmd="$*"
+    if core_setcmd "$_name" "$_cmd"; then
+        ok "$(T ed.ok_cmd "$_name")"
+        dim "$(T gen.reload "$ALIASES_FILE")"
+    else
+        return 1
+    fi
+}
+
+cmd_show() {
+    [ "$#" -ge 1 ] || { fail "$(T err.missing_args show)"; return 2; }
+    show_alias "$1"
+}
+
+cmd_edit_file() {
+    ensure_file
+    pick_editor
+    info "$(T fe.open "$ALIASES_FILE" "$EDITOR_CMD")"
+    "$EDITOR_CMD" "$ALIASES_FILE"
+    printf '\n'
+    cmd_check
+}
+
+# ------------------------------ backup --------------------------------------
+cmd_backup() {
+    ensure_file
+    local _f
+    _f="$(make_backup)" || { fail "$(T err.write_fail "$BACKUP_DIR")"; return 1; }
+    [ -n "$_f" ] && ok "$(T bk.ok "$_f")"
+    return 0
+}
+
+cmd_backups() {
+    local _i=0 _f _sz
+    while IFS= read -r _f; do
+        [ -n "$_f" ] || continue
+        if [ "$_i" -eq 0 ]; then
+            printf "%b%s%b\n" "$C_INFO$C_BOLD" "$(T bk.header)" "$C_RESET"
+        fi
+        _i=$((_i + 1))
+        _sz="$(wc -c < "$_f" 2>/dev/null | tr -d ' ' || true)"
+        printf "  %b%2d)%b %s %b(%s B)%b\n" "$C_KEY" "$_i" "$C_RESET" "$_f" "$C_DIM" "${_sz:-?}" "$C_RESET"
+    done < <(list_backups)
+    if [ "$_i" -eq 0 ]; then
+        info "$(T err.no_backups)"
+        return 1
+    fi
+    return 0
+}
+
+cmd_restore() {
+    local _target="${1:-}" _i=0 _f
+    local _arr=()
+    while IFS= read -r _f; do
+        [ -n "$_f" ] || continue
+        _i=$((_i + 1)); _arr[$_i]="$_f"
+    done < <(list_backups)
+    if [ "$_i" -eq 0 ]; then
+        info "$(T err.no_backups)"; return 1
+    fi
+    if [ -z "$_target" ] || [ "$_target" = "last" ]; then
+        _target="${_arr[1]}"
+    elif [ ! -f "$_target" ]; then
+        case "$_target" in
+            ''|*[!0-9]*) fail "$(T err.not_found "$_target")"; return 1 ;;
+            *)
+                if [ "$_target" -ge 1 ] && [ "$_target" -le "$_i" ]; then
+                    _target="${_arr[$_target]}"
+                else
+                    fail "$(T err.not_found "$_target")"; return 1
+                fi
+                ;;
+        esac
+    fi
+    if [ "$ALIASHUB_INTERACTIVE" = "1" ]; then
+        confirm bk.confirm "$_target" || { info "$(T gen.cancelled)"; return 1; }
+    fi
+    make_backup >/dev/null || true
+    cp -p "$_target" "$ALIASES_FILE" || { fail "$(T err.write_fail "$ALIASES_FILE")"; return 1; }
+    ok "$(T bk.ok_restore "$_target")"
+    return 0
+}
+
+# ------------------------------ fzf -----------------------------------------
+fzf_pick() { # чете 'alias x=...' от stdin, връща избора
+    fzf --height=45% --border --prompt='🔍 ' \
+        --color='fg:#d0d0d0,bg:#1e1e1e,hl:#5fd7ff' \
+        --color='fg+:#ffffff,bg+:#2e2e2e,hl+:#ffaf00' \
+        --color='info:#af87ff,prompt:#5fd7ff,pointer:#ff87d7' \
+        --color='marker:#87ff00,spinner:#ff87d7,header:#87afaf'
+}
+
+fzf_missing_screen() {
+    fail "$(T err.fzf_missing)"
+    local _pm
+    for _pm in dnf apt pacman zypper brew; do
+        if command -v "$_pm" >/dev/null 2>&1; then break; fi
+        _pm=""
+    done
+    case "${_pm:-dnf}" in
+        dnf)    dim "$(T err.fzf_hint 'sudo dnf install fzf')" ;;
+        apt)    dim "$(T err.fzf_hint 'sudo apt install fzf')" ;;
+        pacman) dim "$(T err.fzf_hint 'sudo pacman -S fzf')" ;;
+        zypper) dim "$(T err.fzf_hint 'sudo zypper install fzf')" ;;
+        brew)   dim "$(T err.fzf_hint 'brew install fzf')" ;;
+    esac
+}
+# ============================================================================
+#  p3b — мета (категории/тагове), list/search с филтри, lang, check, doctor,
+#        init, stats
+# ============================================================================
+
+# ------------------------------ мета система ---------------------------------
+normalize_tags() { # <a, b,,c> -> "a,b,c" (без дубликати, без празни)
+    local _in="$1" _o="" _p _seen="" _oldIFS="$IFS"
+    [ -n "$_in" ] || { printf ''; return 0; }
+    IFS=","
+    for _p in $_in; do
+        _p="${_p#"${_p%%[![:space:]]*}"}"
+        _p="${_p%"${_p##*[![:space:]]}"}"
+        [ -n "$_p" ] || continue
+        case ",$_seen," in *",$_p,"*) continue ;; esac
+        _seen="$_seen,$_p"
+        [ -n "$_o" ] && _o="$_o,"
+        _o="$_o$_p"
+    done
+    IFS="$_oldIFS"
+    printf '%s' "$_o"
+}
+
+meta_format() { # <тагове> <категория> -> "tags=… category=…" (може и празно)
+    local _tags="$1" _cat="$2" _out=""
+    _tags="$(normalize_tags "$_tags")"
+    [ -n "$_tags" ] && _out="tags=$_tags"
+    if [ -n "$_cat" ]; then
+        [ -n "$_out" ] && _out="$_out "
+        _out="${_out}category=$_cat"
+    fi
+    printf '%s' "$_out"
+}
+
+alias_lineno() { # <име> -> номер на реда в файла (или нищо)
+    [ -f "$ALIASES_FILE" ] || return 0
+    A_PREFIX="alias $1=" awk 'index($0, ENVIRON["A_PREFIX"]) == 1 { print NR; exit }' \
+        "$ALIASES_FILE" 2>/dev/null
+}
+
+meta_content_of() { # <име> -> съдържанието на метареда над алиаса (без префикса)
+    local _aln _prev
+    _aln="$(alias_lineno "$1")"
+    [ -n "$_aln" ] || return 0
+    [ "$_aln" -gt 1 ] || return 0
+    _prev="$(sed -n "$((_aln - 1))p" "$ALIASES_FILE" 2>/dev/null)"
+    case "$_prev" in
+        "$META_TAG"*) printf '%s' "${_prev#"$META_TAG"}" ;;
+    esac
+    return 0
+}
+
+meta_field() { # <съдържание> <tags|category> -> стойност
+    local _p
+    for _p in $1; do
+        case "$_p" in
+            "$2="*) printf '%s' "${_p#"$2="}"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
+meta_get_tags() { meta_field "$(meta_content_of "$1")" tags; }
+meta_get_cat()  { meta_field "$(meta_content_of "$1")" category; }
+
+_meta_write() { # <име> <съдържание-или-"" (изтриване)> — backup се прави от викащия
+    local _name="$1" _content="$2" _aln _mln=0 _prev _tmp
+    _aln="$(alias_lineno "$_name")"
+    [ -n "$_aln" ] || return 1
+    if [ "$_aln" -gt 1 ]; then
+        _prev="$(sed -n "$((_aln - 1))p" "$ALIASES_FILE" 2>/dev/null)"
+        case "$_prev" in
+            "$META_TAG"*) _mln=$((_aln - 1)) ;;
+        esac
+    fi
+    _tmp="$(mktemp)" || return 1
+    A_MLN="$_mln" A_ALN="$_aln" A_CONTENT="$_content" A_TAG="$META_TAG" awk '
+        NR == ENVIRON["A_MLN"] { next }
+        NR == ENVIRON["A_ALN"] {
+            if (ENVIRON["A_CONTENT"] != "") print ENVIRON["A_TAG"] ENVIRON["A_CONTENT"]
+            print
+            next
+        }
+        { print }
+    ' "$ALIASES_FILE" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    mv "$_tmp" "$ALIASES_FILE"
+}
+
+core_set_meta() { # <име> <тагове> <категория> — празни стойности изчистват
+    local _name="$1" _tags="$2" _cat="$3" _meta
+    [ -n "$(alias_lineno "$_name")" ] || { fail "$(T err.not_found "$_name")"; return 1; }
+    case "$_cat" in
+        *[[:space:],]*) fail "$(T cat.bad "$_cat")"; return 1 ;;
+    esac
+    case "$_tags" in
+        *[[:space:]]*) fail "$(T tag.bad "$_tags")"; return 1 ;;
+    esac
+    _meta="$(meta_format "$_tags" "$_cat")"
+    make_backup >/dev/null || true
+    _meta_write "$_name" "$_meta" || { fail "$(T err.write_fail "$ALIASES_FILE")"; return 1; }
+    return 0
+}
+
+# ------------------------------ list ----------------------------------------
+cmd_list() { # list [--raw] [--tag T] [--category C] [-g]
+    ensure_file
+    local _raw=0 _tag="" _cat="" _grouped=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --raw)                _raw=1 ;;
+            --tag)                [ -n "${2:-}" ] || { fail "$(T err.missing_args --tag)"; return 2; }; _tag="$2"; shift ;;
+            --tag=*)              _tag="${1#*=}" ;;
+            --category|--cat)     [ -n "${2:-}" ] || { fail "$(T err.missing_args --category)"; return 2; }; _cat="$2"; shift ;;
+            --category=*|--cat=*) _cat="${1#*=}" ;;
+            -g|--grouped)         _grouped=1 ;;
+            *)                    fail "$(T err.unknown_cmd "$1")"; return 2 ;;
+        esac
+        shift
+    done
+    local _flt=""
+    [ -n "$_tag" ] && _flt="$(T flt.tag "$_tag")"
+    [ -n "$_cat" ] && _flt="$_flt$( [ -n "$_flt" ] && printf ' · ' )$(T flt.cat "$_cat")"
+
+    local _tmp; _tmp="$(mktemp)" || return 1
+    local _name _val _tg _ct _hit _t _oldIFS _cnt=0
+    while IFS="$_US" read -r _name _val _tg _ct; do
+        [ -n "$_name" ] || continue
+        _hit=1
+        if [ -n "$_tag" ]; then
+            _hit=0
+            _oldIFS="$IFS"; IFS=","
+            for _t in $_tg; do
+                [ "$(lower "$_t")" = "$(lower "$_tag")" ] && { _hit=1; break; }
+            done
+            IFS="$_oldIFS"
+        fi
+        if [ "$_hit" -eq 1 ] && [ -n "$_cat" ]; then
+            [ "$(lower "$_ct")" = "$(lower "$_cat")" ] || _hit=0
+        fi
+        [ "$_hit" -eq 1 ] || continue
+        printf '%s%s%s%s%s%s%s\n' "$_name" "$_US" "$_val" "$_US" "$_tg" "$_US" "$_ct" >> "$_tmp"
+        _cnt=$((_cnt + 1))
+    done < <(alias_entries)
+
+    if [ "$_raw" -eq 1 ]; then
+        while IFS="$_US" read -r _name _val _tg _ct; do
+            [ -n "$_name" ] || continue
+            printf 'alias %s=%s\n' "$_name" "$_val"
+        done < "$_tmp"
+        rm -f "$_tmp"
+        return 0
+    fi
+
+    printf "%b📦 %s: %s · 📁 %s%b\n" "$C_INFO$C_BOLD" "$(T gen.total)" "$_cnt" "$ALIASES_FILE" "$C_RESET"
+    if [ -n "$_flt" ]; then printf "%b%s%b\n" "$C_INFO" "$_flt" "$C_RESET"; fi
+    if [ "$_cnt" -eq 0 ]; then
+        if [ -n "$_flt" ]; then
+            info "$(T flt.none)"
+        else
+            info "$(T gen.none)"
+        fi
+        rm -f "$_tmp"
+        return 0
+    fi
+
+    if [ "$_grouped" -eq 1 ]; then
+        # групиране по категория — в реда на появата; „без категория" най-отдолу
+        local _cats="" _grp _k
+        while IFS="$_US" read -r _name _val _tg _ct; do
+            [ -n "$_name" ] || continue
+            [ -n "$_ct" ] || continue
+            case "$_cats" in *"$_ct"*) ;; *) _cats="$_cats$_ct"$'\n' ;; esac
+        done < "$_tmp"
+        while IFS= read -r _grp; do
+            [ -n "$_grp" ] || continue
+            _k="$(awk -F "$_US" -v c="$_grp" '$4 == c { n++ } END { print n + 0 }' "$_tmp")"
+            [ "$_k" -gt 0 ] || continue
+            printf '\n%b── %s (%s) ──%b\n' "$C_TITLE$C_BOLD" "$_grp" "$_k" "$C_RESET"
+            awk -F "$_US" -v c="$_grp" '$4 == c' "$_tmp" | render_entries_stdin
+        done <<< "$_cats"
+        _k="$(awk -F "$_US" '$4 == "" { n++ } END { print n + 0 }' "$_tmp")"
+        if [ "$_k" -gt 0 ]; then
+            printf '\n%b── %s (%s) ──%b\n' "$C_TITLE$C_BOLD" "$(T grp.uncat)" "$_k" "$C_RESET"
+            awk -F "$_US" '$4 == ""' "$_tmp" | render_entries_stdin
+        fi
+    else
+        render_entries_stdin < "$_tmp"
+    fi
+    rm -f "$_tmp"
+    return 0
+}
+
+# ------------------------------ search --------------------------------------
+cmd_search() {
+    ensure_file
+    local _term="${1:-}" _sel _name _val
+    if [ -z "$_term" ] && command -v fzf >/dev/null 2>&1; then
+        _sel="$(alias_lines | sed 's/^alias //' | fzf --height=45% --border --prompt='🔍 ' \
+            --color='fg:#d0d0d0,bg:#1e1e1e,hl:#5fd7ff' \
+            --color='fg+:#ffffff,bg+:#2e2e2e,hl+:#ffaf00' \
+            --color='info:#af87ff,prompt:#5fd7ff,pointer:#ff87d7' \
+            --color='marker:#87ff00,spinner:#ff87d7,header:#87afaf' || true)"
+        [ -n "$_sel" ] || return 0
+        _sel="alias $_sel"
+        _name="${_sel#alias }"; _val="${_name#*=}"; _name="${_name%%=*}"
+        printf "%b%s%b = %b%s%b\n" "$C_KEY$C_BOLD" "$_name" "$C_RESET" "$C_VAL" "$(unquote "$_val")" "$C_RESET"
+        return 0
+    fi
+    [ -n "$_term" ] || { fail "$(T err.missing_args search)"; return 2; }
+    local _lt _found=0 _tmp
+    _lt="$(lower "$_term")"
+    _tmp="$(mktemp)" || return 1
+    local _name _val _tg _ct _uv
+    while IFS="$_US" read -r _name _val _tg _ct; do
+        [ -n "$_name" ] || continue
+        _uv="$(lower "$(unquote "$_val")")"
+        # case с кавички около променливата = буквално търсене (без glob)
+        case "$(lower "$_name")|$_uv|$(lower "$_tg")|$(lower "$_ct")" in
+            *"$_lt"*)
+                printf '%s%s%s%s%s%s%s\n' "$_name" "$_US" "$_val" "$_US" "$_tg" "$_US" "$_ct" >> "$_tmp"
+                _found=$((_found + 1))
+                ;;
+        esac
+    done < <(alias_entries)
+    if [ "$_found" -eq 0 ]; then
+        rm -f "$_tmp"
+        info "$(T se.none "$_term")"
+        return 1
+    fi
+    render_entries_stdin < "$_tmp"
+    info "$(T se.found "$_found")"
+    rm -f "$_tmp"
+    return 0
+}
+
+# ------------------------------ tag / category -------------------------------
+cmd_tag() { # tag ИМЕ [ТАГОВЕ] — без аргументи показва; празен низ изчиства
+    [ "$#" -ge 1 ] || { fail "$(T err.missing_args tag)"; return 2; }
+    local _name="$1"; shift
+    if [ "$#" -eq 0 ]; then
+        local _cur
+        _cur="$(meta_get_tags "$_name")"
+        if [ -n "$_cur" ]; then
+            ok "$(T tag.current "$_name" "$_cur")"
+        else
+            info "$(T tag.none "$_name")"
+        fi
+        return 0
+    fi
+    local _tags="$*"
+    local _cat _cur
+    _cat="$(meta_get_cat "$_name")"
+    if core_set_meta "$_name" "$_tags" "$_cat"; then
+        _cur="$(meta_get_tags "$_name")"
+        if [ -n "$_cur" ]; then
+            ok "$(T tag.ok "$_name" "$_cur")"
+        else
+            ok "$(T tag.cleared)"
+        fi
+        dim "$(T gen.reload "$ALIASES_FILE")"
+    else
+        return 1
+    fi
+}
+
+cmd_category() { # category ИМЕ [КАТЕГОРИЯ]
+    [ "$#" -ge 1 ] || { fail "$(T err.missing_args category)"; return 2; }
+    local _name="$1"; shift
+    if [ "$#" -eq 0 ]; then
+        local _cur
+        _cur="$(meta_get_cat "$_name")"
+        if [ -n "$_cur" ]; then
+            ok "$(T cat.current "$_name" "$_cur")"
+        else
+            info "$(T cat.none "$_name")"
+        fi
+        return 0
+    fi
+    local _cat="$*"
+    local _tg _cur
+    _tg="$(meta_get_tags "$_name")"
+    if core_set_meta "$_name" "$_tg" "$_cat"; then
+        _cur="$(meta_get_cat "$_name")"
+        if [ -n "$_cur" ]; then
+            ok "$(T cat.ok "$_name" "$_cur")"
+        else
+            ok "$(T cat.cleared)"
+        fi
+        dim "$(T gen.reload "$ALIASES_FILE")"
+    else
+        return 1
+    fi
+}
+
+# ------------------------------ език ----------------------------------------
+cmd_lang() { # lang [bg|en] — без аргумент показва; с аргумент запазва трайно
+    local _l="${1:-}"
+    if [ -z "$_l" ]; then
+        ok "$(T lg.current "$LANG_MODE")"
+        dim "$(T lg.hint)"
+        return 0
+    fi
+    _l="$(lower "$_l")"
+    case "$_l" in
+        bg|en) ;;
+        *) fail "$(T lg.usage)"; return 2 ;;
+    esac
+    if mkdir -p "$CONFIG_DIR" 2>/dev/null; then
+        local _tmp _old
+        _tmp="$(mktemp)" || return 1
+        _old=""
+        [ -f "$CONFIG_FILE" ] && _old="$(grep -v '^lang=' "$CONFIG_FILE" 2>/dev/null || true)"
+        {
+            [ -n "$_old" ] && printf '%s\n' "$_old"
+            printf 'lang=%s\n' "$_l"
+        } > "$_tmp"
+        if mv "$_tmp" "$CONFIG_FILE" 2>/dev/null; then
+            LANG_MODE="$_l"
+            ok "$(T lg.saved "$CONFIG_FILE")"
+            return 0
+        fi
+        rm -f "$_tmp"
+    fi
+    LANG_MODE="$_l"
+    warn "$(T lg.cfg_fail)"
+    return 0
+}
+
+# ------------------------------ проверка на файла ----------------------------
+# Философия: bash -n е върховният съдия за синтаксис; този проход прави само
+# смислови проверки на алиас-редовете на най-високо ниво. Функциите, if/for
+# блоковете, export-ите и всякаква кирилица в тях са НАПЪЛНО ВАЛИДНИ и НЕ се
+# докладват (тук беше проблемът „148 фалшиви проблема" в v3).
+CK_ISSUES=0
+CK_TOTAL=0
+
+_check_pass() { # $1 = quiet|verbose — пълни CK_ISSUES/CK_TOTAL
+    local _mode="${1:-verbose}"
+    local _line _ln=0 _name _val _depth=0 _o _c _p _ok
+    CK_ISSUES=0
+    CK_TOTAL=0
+    [ -f "$ALIASES_FILE" ] || return 0
+    # A) реален синтактичен анализ от bash
+    local _bn
+    _bn="$(bash -n "$ALIASES_FILE" 2>&1)" || {
+        [ "$_mode" = "verbose" ] && warn "$(T ck.syntax "$_bn")"
+        CK_ISSUES=$((CK_ISSUES + 1))
+    }
+    # B) ред по ред — смислови проверки
+    local _dups=""
+    while IFS= read -r _line; do
+        _ln=$((_ln + 1))
+        case "$_line" in ""|\#*) continue ;; esac
+        case "$_line" in
+            "$META_TAG"*)
+                _ok=1
+                for _p in ${_line#"$META_TAG"}; do
+                    case "$_p" in
+                        tags=*)     [ -n "${_p#tags=}" ] || _ok=0 ;;
+                        category=*) [ -n "${_p#category=}" ] || _ok=0 ;;
+                        *) _ok=0 ;;
+                    esac
+                done
+                if [ "$_ok" -eq 0 ]; then
+                    [ "$_mode" = "verbose" ] && warn "$(T ck.meta_bad "$_ln" "$_line")"
+                    CK_ISSUES=$((CK_ISSUES + 1))
+                fi
+                continue
+                ;;
+            "alias "*) : ;;
+            *)
+                _o="${_line//[!{]/}"
+                _c="${_line//[!}]/}"
+                _depth=$(( _depth + ${#_o} - ${#_c} ))
+                continue
+                ;;
+        esac
+        if [ "$_depth" -gt 0 ]; then
+            _o="${_line//[!{]/}"
+            _c="${_line//[!}]/}"
+            _depth=$(( _depth + ${#_o} - ${#_c} ))
+            continue
+        fi
+        case "$_line" in
+            *"="*) : ;;
+            *)
+                [ "$_mode" = "verbose" ] && warn "$(T ck.no_eq "$_ln" "$_line")"
+                CK_ISSUES=$((CK_ISSUES + 1))
+                continue
+                ;;
+        esac
+        _name="${_line#alias }"; _name="${_name%%=*}"
+        _val="${_line#*=}"
+        is_valid_name "$_name" || {
+            [ "$_mode" = "verbose" ] && warn "$(T ck.name_bad "$_ln" "$_name")"
+            CK_ISSUES=$((CK_ISSUES + 1))
+        }
+        [ -n "$(unquote "$_val")" ] || {
+            [ "$_mode" = "verbose" ] && warn "$(T ck.empty_cmd "$_ln")"
+            CK_ISSUES=$((CK_ISSUES + 1))
+        }
+        case "$_val" in
+            "'"*|'"'*) : ;;
+            *[[:space:]]*)
+                [ "$_mode" = "verbose" ] && warn "$(T ck.unquoted "$_ln" "$_line")"
+                CK_ISSUES=$((CK_ISSUES + 1))
+                ;;
+        esac
+        CK_TOTAL=$((CK_TOTAL + 1))
+        _dups="$_dups$_name"$'\n'
+    done < "$ALIASES_FILE"
+    local _d
+    for _d in $(printf '%s' "$_dups" | sort | uniq -d); do
+        [ "$_mode" = "verbose" ] && warn "$(T ck.dup "$_d")"
+        CK_ISSUES=$((CK_ISSUES + 1))
+    done
+    return 0
+}
+
+cmd_check() {
+    ensure_file
+    _check_pass verbose
+    if [ "$CK_ISSUES" -eq 0 ]; then
+        ok "$(T ck.ok "$CK_TOTAL")"
+        local _others
+        _others="$(grep -cv -e '^alias ' -e '^#' -e '^$' "$ALIASES_FILE" 2>/dev/null || true)"
+        case "${_others:-0}" in
+            [1-9]*) dim "  $(T ck.funcs)" ;;
+        esac
+        return 0
+    fi
+    fail "$(T ck.issues "$CK_ISSUES")"
+    return 1
+}
+
+# ------------------------------ диагностика ---------------------------------
+_dr_bad=0
+dr_ok()  { printf "  %b%s %s%b\n" "$C_SUCCESS" "$(T dr.mark_ok)" "$1" "$C_RESET"; }
+dr_bad() { printf "  %b%s %s%b\n" "$C_ERROR"   "$(T dr.mark_bad)" "$1" "$C_RESET"; _dr_bad=$((_dr_bad + 1)); }
+dr_opt() { printf "  %b%s %s%b\n" "$C_DIM"     "~"                 "$1" "$C_RESET"; }
+
+cmd_doctor() {
+    local _n _rc
+    _dr_bad=0
+    printf "%b%s%b\n\n" "$C_PRIMARY$C_BOLD" "$(T t.doctor)" "$C_RESET"
+    # 1. файл
+    _n="$(count_aliases)"
+    if [ -f "$ALIASES_FILE" ]; then
+        dr_ok "$(T dr.file): $ALIASES_FILE ($_n)"
+    else
+        dr_bad "$(T dr.file): $ALIASES_FILE — $(T dr.file_missing)"
+    fi
+    # 2. синтаксис и смислови проверки (тихо; без фалшиви положителни)
+    _check_pass quiet
+    if [ "$CK_ISSUES" -eq 0 ]; then
+        dr_ok "$(T dr.file_syntax)"
+    else
+        dr_bad "$(T dr.file_syntax) — $(T dr.ck_issues "$CK_ISSUES")"
+    fi
+    # 3. .bashrc
+    if [ -f "$HOME/.bashrc" ] && grep -Fq "$ALIASES_FILE" "$HOME/.bashrc" 2>/dev/null; then
+        dr_ok "$(T dr.rc_bash)"
+    else
+        dr_bad "$(T dr.rc_bash)"
+    fi
+    # 4. .zshrc — само ако zsh е наличен/използван
+    if command -v zsh >/dev/null 2>&1 || [ -f "$HOME/.zshrc" ]; then
+        if [ -f "$HOME/.zshrc" ] && grep -Fq "$ALIASES_FILE" "$HOME/.zshrc" 2>/dev/null; then
+            dr_ok "$(T dr.rc_zsh)"
+        else
+            dr_bad "$(T dr.rc_zsh)"
+        fi
+    fi
+    # 5. редактор
+    pick_editor
+    dr_ok "$(T dr.editor): $EDITOR_CMD"
+    # 6. fzf (опционално)
+    if command -v fzf >/dev/null 2>&1; then
+        dr_ok "$(T dr.fzf)"
+    else
+        dr_opt "$(T dr.fzf) — $(T dr.not_set)"
+    fi
+    # 7. backup папка
+    if ensure_backup_dir && touch "$BACKUP_DIR/.wtest" 2>/dev/null; then
+        rm -f "$BACKUP_DIR/.wtest"
+        dr_ok "$(T dr.backups): $BACKUP_DIR"
+    else
+        dr_bad "$(T dr.backups): $BACKUP_DIR"
+    fi
+    # 8. език
+    dr_ok "$(T dr.lang): $LANG_MODE"
+    printf '\n'
+    if [ "$_dr_bad" -eq 0 ]; then
+        ok "$(T dr.all_ok)"
+        return 0
+    fi
+    warn "$(T dr.hint_init)"
+    fail "$(T dr.issues "$_dr_bad")"
+    return 1
+}
+
+# ------------------------------ init ----------------------------------------
+cmd_init() {
+    ensure_file
+    local _rc _path _tmp
+    printf "%b%s%b\n\n" "$C_PRIMARY$C_BOLD" "$(T t.init)" "$C_RESET"
+    for _rc in .bashrc .zshrc; do
+        _path="$HOME/$_rc"
+        if [ "$_rc" = ".zshrc" ] && [ ! -f "$_path" ] && ! command -v zsh >/dev/null 2>&1; then
+            dim "$(T in.skip_zsh)"
+            continue
+        fi
+        if [ -f "$_path" ] && grep -Fq "# >>> aliasctl (" "$_path" 2>/dev/null; then
+            # надгради стария aliasctl блок от v3.x (прави се ПРЕДИ проверката
+            # за нов блок — иначе старият блок може да остане завинаги)
+            _tmp="$(mktemp)"
+            sed 's|# >>> aliasctl (|# >>> aliashub (|g; s|# <<< aliasctl <<<|# <<< aliashub <<<|g' \
+                "$_path" > "$_tmp" && mv "$_tmp" "$_path" || { rm -f "$_tmp"; }
+            ok "$(T in.upgraded "$_path")"
+            continue
+        fi
+        if [ -f "$_path" ] && grep -Fq "# >>> aliashub (" "$_path" 2>/dev/null; then
+            dim "$(T in.present "$_path")"
+            continue
+        fi
+        if [ ! -f "$_path" ]; then
+            : > "$_path"
+            ok "$(T in.created "$_path")"
+        fi
+        { printf '\n# >>> aliashub (%s) >>>\n' "$ALIASHUB_SITE"
+          printf '[ -f "%s" ] && source "%s"\n' "$ALIASES_FILE" "$ALIASES_FILE"
+          printf '# <<< aliashub <<<\n'
+        } >> "$_path"
+        ok "$(T in.added "$_path")"
+    done
+    printf '\n%s\n' "$(T hp.autoload)"
+}
+
+# ------------------------------ статистика ----------------------------------
+cmd_stats() {
+    ensure_file
+    local _n _sz _mt _lb
+    _n="$(count_aliases)"
+    _sz="$(wc -c < "$ALIASES_FILE" 2>/dev/null | tr -d ' ' || true)"
+    _mt="$(date -r "$ALIASES_FILE" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+    _lb="$(list_backups | head -n 1 || true)"
+    [ -n "$_lb" ] && _lb="$(basename "$_lb")"
+    printf "%b%s%b\n\n" "$C_PRIMARY$C_BOLD" "$(T t.stats)" "$C_RESET"
+    printf "  %b%s%b %s\n" "$C_KEY" "$(pad_to "$(T st.count)" 16)" "$C_RESET" "$_n"
+    printf "  %b%s%b %s\n" "$C_KEY" "$(pad_to "$(T st.size)" 16)" "$C_RESET" "${_sz:-?} B"
+    printf "  %b%s%b %s\n" "$C_KEY" "$(pad_to "$(T st.modified)" 16)" "$C_RESET" "${_mt:-?}"
+    printf "  %b%s%b %s\n" "$C_KEY" "$(pad_to "$(T st.last_backup)" 16)" "$C_RESET" "${_lb:-$(T st.never)}"
+    if [ "$_n" -gt 0 ]; then
+        local _catline
+        _catline="$(alias_entries | A_US="$_US" A_UNCAT="$(T grp.uncat)" awk '
+            BEGIN { FS = ENVIRON["A_US"] }
+            {
+                c = ($4 == "" ? "UNCAT" : $4)
+                n[c]++
+                if ($3 != "") tg++
+            }
+            END {
+                for (c in n) printf "%d\t%s\n", n[c], (c == "UNCAT" ? ENVIRON["A_UNCAT"] : c)
+                if (tg != "") printf "0\t__TAGGED__%d\n", tg
+            }' | sort -rn | A_TAGGED="$(T st.tagged)" awk '
+            BEGIN { first = 1 }
+            {
+                if ($2 ~ /^__TAGGED__/) { tg = $2; sub(/^__TAGGED__/, "", tg); tagged = tg; next }
+                if (first != 1) printf " · "
+                printf "%s: %s", $2, $1
+                first = 0
+            }
+            END {
+                if (tagged != "") printf " · %s: %s", ENVIRON["A_TAGGED"], tagged
+            }')"
+        [ -n "$_catline" ] && printf "  %b%s%b %s\n" "$C_KEY" "$(pad_to "$(T st.by_cat)" 16)" "$C_RESET" "$_catline"
+    fi
+    return 0
+}
+# ============================================================================
+#  p4 — UI: хедър, екрани, меню
+# ============================================================================
+clear_screen() { if [ -t 1 ]; then clear 2>/dev/null || true; fi; }
+
+ui_hline() { # <ляво> <дясно>
+    printf "%b%s%s%s%b\n" "$C_BORDER" "$1" \
+        "$(repeat_char "$BOX_H" $((HEADER_WIDTH - ${#1} - ${#2})))" "$2" "$C_RESET"
+}
+
+ui_box_text() { # <текст> <допълнителни колони (емоджи)> <цвят>
+    local _text="$1" _extra="${2:-0}" _color="${3:-$C_TITLE}"
+    local _fill=$((HEADER_WIDTH - 2 - ${#_text} - _extra))
+    [ "$_fill" -lt 0 ] && _fill=0
+    printf "%b%s%s%s%s%b%s%s%s%b\n" \
+        "$C_BORDER" "$BOX_V" "$C_RESET" "$_color" "$_text" "$C_RESET" \
+        "$(repeat_char ' ' "$_fill")" "$C_BORDER" "$BOX_V" "$C_RESET"
+}
+
+print_header() {
+    clear_screen
+    printf '\n'
+    ui_hline "$BOX_TL" "$BOX_TR"
+    ui_box_text "$(T app.title)" 1 "$C_TITLE$C_BOLD"
+    ui_hline "$BOX_BL" "$BOX_BR"
+    dim " 📁 $ALIASES_FILE · 📦 $(count_aliases) $(T gen.aliases_word) · 🌐 $ALIASHUB_SITE"
+}
+
+menu_row() {
+    printf "  %b[%s]%b %s\n" "$C_KEY$C_BOLD" "$1" "$C_RESET" "$2"
+}
+
+screen_title() {
+    printf "\n%b%s%b\n" "$C_INFO$C_BOLD" "$1" "$C_RESET"
+}
+
+reload_hint() { dim "$(T gen.reload "$ALIASES_FILE")"; }
+
+# ------------------------------ екрани --------------------------------------
+list_screen() {
+    print_header
+    local _n; _n="$(count_aliases)"
+    screen_title "$(T t.list)"
+    if [ "$_n" -eq 0 ]; then
+        printf '\n'
+        warn "  ⚠️  $(T gen.none)"
+    else
+        cmd_list
+    fi
+    printf '\n'
+    pause
+}
+
+add_screen() {
+    print_header
+    screen_title "$(T t.add)"
+    ask_input "$(T add.ask_name)" || return
+    local _name="$_IN"
+    [ -n "$_name" ] || { printf '\n'; fail "$(T err.empty_name)"; sleep 1; return; }
+    ask_input "$(T add.ask_cmd)" || return
+    local _cmd="$_IN"
+    ask_input "$(T add.ask_cat)" || return
+    local _cat="$_IN"
+    ask_input "$(T add.ask_tags)" || return
+    local _tags="$_IN"
+    if core_add "$_name" "$_cmd" "$_tags" "$_cat"; then
+        printf '\n'
+        ok "$(T add.ok "$_name")"
+        reload_hint
+    fi
+    printf '\n'
+    pause
+}
+
+remove_screen() {
+    print_header
+    screen_title "$(T t.rm)"
+    local _n; _n="$(count_aliases)"
+    if [ "$_n" -eq 0 ]; then
+        printf '\n'
+        warn "$(T rm.none)"
+        sleep 1
+        return
+    fi
+    ask_input "$(T rm.ask)" || return
+    local _name="$_IN"
+    [ -n "$_name" ] || { printf '\n'; fail "$(T err.empty_name)"; sleep 1; return; }
+    if core_remove "$_name"; then
+        printf '\n'
+        ok "$(T rm.ok "$_name")"
+        reload_hint
+    fi
+    printf '\n'
+    pause
+}
+
+_meta_edit_flow() { # <име> <tags|category> — общ поток за тагове/категория
+    local _name="$1" _kind="$2" _cur _msg_cur _msg_none _msg_ok _msg_clr _ask
+    if [ "$_kind" = "tags" ]; then
+        _cur="$(meta_get_tags "$_name")"
+        _msg_cur="tag.current"; _msg_none="tag.none"
+        _msg_ok="tag.ok"; _msg_clr="tag.cleared"
+        _ask="ed.m7"
+    else
+        _cur="$(meta_get_cat "$_name")"
+        _msg_cur="cat.current"; _msg_none="cat.none"
+        _msg_ok="cat.ok"; _msg_clr="cat.cleared"
+        _ask="ed.m6"
+    fi
+    if [ -n "$_cur" ]; then
+        ok "$(T "$_msg_cur" "$_name" "$_cur")"
+    else
+        info "$(T "$_msg_none" "$_name")"
+    fi
+    ask_input "$(T "$_ask")" "$_cur" || return 1
+    [ "$_IN" = "$_cur" ] && { info "$(T ed.m8)"; return 1; }
+    if [ "$_kind" = "tags" ]; then
+        core_set_meta "$_name" "$_IN" "$(meta_get_cat "$_name")" || return 1
+        _cur="$(meta_get_tags "$_name")"
+    else
+        core_set_meta "$_name" "$(meta_get_tags "$_name")" "$_IN" || return 1
+        _cur="$(meta_get_cat "$_name")"
+    fi
+    if [ -n "$_cur" ]; then
+        ok "$(T "$_msg_ok" "$_name" "$_cur")"
+    else
+        ok "$(T "$_msg_clr")"
+    fi
+    reload_hint
+    return 0
+}
+
+edit_alias_flow() { # <име> — подменю: команда, име, тагове, категория
+    local _name="$1" _line _val _nn
+    _line="$(awk_get_line "$_name")"
+    if [ -z "$_line" ]; then
+        fail "$(T err.not_found "$_name")"
+        sleep 1
+        return
+    fi
+    _val="$(unquote "${_line#*=}")"
+    printf '\n'
+    show_alias "$_name"
+    printf '\n'
+    printf "  %b[1]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T ed.m1)"
+    printf "  %b[2]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T ed.m2)"
+    printf "  %b[3]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T ed.m3)"
+    printf "  %b[4]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T ed.m4)"
+    printf "  %b[0]%b %s\n\n" "$C_KEY$C_BOLD" "$C_RESET" "$(T ed.m5)"
+    ask_input "$(T menu.prompt)" || return
+    case "$_IN" in
+        1)
+            ask_input "$(T ed.new_cmd)" "$_val" || return
+            if core_setcmd "$_name" "$_IN"; then
+                ok "$(T ed.ok_cmd "$_name")"
+                reload_hint
+            fi
+            ;;
+        2)
+            ask_input "$(T ed.new_name)" || return
+            _nn="$_IN"
+            if core_rename "$_name" "$_nn"; then
+                ok "$(T ed.ok_name "$_name" "$_nn")"
+                reload_hint
+            fi
+            ;;
+        3) _meta_edit_flow "$_name" tags ;;
+        4) _meta_edit_flow "$_name" category ;;
+        *) return ;;
+    esac
+    printf '\n'
+    pause
+}
+
+pick_alias_numbered() { # -> име в $_IN (0 = отказ)
+    local _names _i=0 _n
+    _names="$(alias_names)"
+    if [ -z "$_names" ]; then
+        printf '\n'
+        warn "$(T gen.none)"
+        printf '\n'
+        pause
+        return 1
+    fi
+    printf '\n'
+    while IFS= read -r _n; do
+        _i=$((_i + 1))
+        printf "  %b%2d)%b %s\n" "$C_KEY" "$_i" "$C_RESET" "$_n"
+    done <<< "$_names"
+    printf '\n'
+    ask_input "$(T ed.pick_num)" || return 1
+    case "$_IN" in ''|*[!0-9]*) fail "$(T ed.bad_pick)"; return 1 ;; esac
+    if [ "$_IN" -lt 1 ] || [ "$_IN" -gt "$_i" ]; then
+        fail "$(T ed.bad_pick)"
+        return 1
+    fi
+    _IN="$(printf '%s\n' "$_names" | sed -n "${_IN}p")"
+    return 0
+}
+
+edit_screen() {
+    print_header
+    screen_title "$(T t.edit)"
+    ask_input "$(T ed.ask)" || return
+    local _name="$_IN"
+    if [ -z "$_name" ]; then
+        if command -v fzf >/dev/null 2>&1; then
+            _name="$(alias_names | fzf --height=35% --border --prompt='✏️ ' || true)"
+            [ -n "$_name" ] || return
+        else
+            pick_alias_numbered || return
+            _name="$_IN"
+        fi
+    fi
+    edit_alias_flow "$_name"
+}
+
+search_screen() {
+    print_header
+    screen_title "$(T t.search)"
+    if command -v fzf >/dev/null 2>&1; then
+        fzf_screen
+        return
+    fi
+    ask_input "$(T se.ask)" || return
+    [ -n "$_IN" ] || return
+    printf '\n'
+    cmd_search "$_IN"
+    printf '\n'
+    pause
+}
+
+fzf_screen() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        printf '\n'
+        fzf_missing_screen
+        printf '\n'
+        pause
+        return
+    fi
+    local _sel _name _val
+    _sel="$(alias_lines | sed 's/^alias //' | fzf_pick || true)"
+    [ -n "$_sel" ] || return
+    _name="${_sel%%=*}"
+    _val="$(unquote "${_sel#*=}")"
+    print_header
+    screen_title "$(T fz.selected)"
+    printf "%b%s%b = %b%s%b\n\n" "$C_KEY$C_BOLD" "$_name" "$C_RESET" "$C_VAL" "$_val" "$C_RESET"
+    printf "  %s\n\n" "$(T fz.actions)"
+    ask_input "$(T menu.prompt)" || return
+    case "$_IN" in
+        1) edit_alias_flow "$_name" ;;
+        2)
+            if core_remove "$_name"; then
+                ok "$(T rm.ok "$_name")"
+                reload_hint
+            fi
+            printf '\n'
+            pause
+            ;;
+        *) return ;;
+    esac
+}
+
+file_screen() {
+    print_header
+    screen_title "$(T t.file)"
+    pick_editor
+    info "$(T fe.open "$ALIASES_FILE" "$EDITOR_CMD")"
+    printf '\n'
+    "$EDITOR_CMD" "$ALIASES_FILE" || true
+    printf '\n'
+    cmd_check
+    printf '\n'
+    pause
+}
+
+backup_screen() {
+    print_header
+    screen_title "$(T t.backup)"
+    printf "  %b[1]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T bk.m1)"
+    printf "  %b[2]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T bk.m2)"
+    printf "  %b[3]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T bk.m3)"
+    printf "  %b[0]%b %s\n\n" "$C_KEY$C_BOLD" "$C_RESET" "$(T bk.m4)"
+    ask_input "$(T menu.prompt)" || return
+    case "$_IN" in
+        1)
+            local _f
+            _f="$(make_backup)" && [ -n "$_f" ] && ok "$(T bk.ok "$_f")"
+            printf '\n'
+            pause
+            ;;
+        2)
+            printf '\n'
+            cmd_backups
+            printf '\n'
+            pause
+            ;;
+        3)
+            printf '\n'
+            cmd_backups || { printf '\n'; pause; return; }
+            printf '\n'
+            ask_input "$(T bk.pick)" || return
+            case "$_IN" in
+                ''|*[!0-9]*) fail "$(T ed.bad_pick)"; sleep 1; return ;;
+            esac
+            printf '\n'
+            cmd_restore "$_IN"
+            printf '\n'
+            pause
+            ;;
+        *) return ;;
+    esac
+}
+
+check_screen() {
+    print_header
+    screen_title "$(T t.check)"
+    printf '\n'
+    cmd_check
+    printf '\n'
+    cmd_doctor
+    printf '\n'
+    pause
+}
+
+# --------------------- категории и тагове (екран) ----------------------------
+count_cat() { # <категория> -> брой алиаси в нея
+    local _n=0 _a _v _t _c
+    while IFS="$_US" read -r _a _v _t _c; do
+        [ "$_c" = "$1" ] && _n=$((_n + 1))
+    done < <(alias_entries)
+    printf '%s' "$_n"
+}
+
+count_tag() { # <таг> -> брой алиаси с този таг
+    local _n=0 _a _v _tg _c _t _oldIFS="$IFS"
+    while IFS="$_US" read -r _a _v _tg _c; do
+        IFS=","
+        for _t in $_tg; do
+            [ "$_t" = "$1" ] && { _n=$((_n + 1)); break; }
+        done
+    done < <(alias_entries)
+    IFS="$_oldIFS"
+    printf '%s' "$_n"
+}
+
+_list_filtered_to_tmp() { # <tag|cat> <стойност> -> $_TMPF (или 1, ако празно)
+    local _kind="$1" _what="$2" _name _val _tg _ct _hit _t _oldIFS
+    _TMPF="$(mktemp)" || return 1
+    while IFS="$_US" read -r _name _val _tg _ct; do
+        [ -n "$_name" ] || continue
+        _hit=0
+        if [ "$_kind" = "tag" ]; then
+            _oldIFS="$IFS"; IFS=","
+            for _t in $_tg; do
+                [ "$_t" = "$_what" ] && { _hit=1; break; }
+            done
+            IFS="$_oldIFS"
+        else
+            [ "$_ct" = "$_what" ] && _hit=1
+        fi
+        [ "$_hit" -eq 1 ] && printf '%s%s%s%s%s%s%s\n' \
+            "$_name" "$_US" "$_val" "$_US" "$_tg" "$_US" "$_ct" >> "$_TMPF"
+    done < <(alias_entries)
+    if [ ! -s "$_TMPF" ]; then
+        rm -f "$_TMPF"
+        warn "$(T flt.none)"
+        return 1
+    fi
+    return 0
+}
+
+_pick_alias_from_tmp() { # номериран избор от $_TMPF -> име в $_IN
+    local _i=0 _line _name _tot _l
+    while IFS= read -r _line; do
+        [ -n "$_line" ] || continue
+        _i=$((_i + 1))
+        _name="${_line%%"$_US"*}"
+        printf "  %b%2d)%b %s\n" "$C_KEY" "$_i" "$C_RESET" "$_name"
+    done < "$_TMPF"
+    printf '\n'
+    ask_input "$(T ed.pick_num)" || { rm -f "$_TMPF"; return 1; }
+    case "$_IN" in
+        ''|*[!0-9]*) rm -f "$_TMPF"; fail "$(T ed.bad_pick)"; return 1 ;;
+    esac
+    _tot="$(wc -l < "$_TMPF" | tr -d ' ')"
+    if [ "$_IN" -lt 1 ] || [ "$_IN" -gt "$_tot" ]; then
+        rm -f "$_TMPF"
+        fail "$(T ed.bad_pick)"
+        return 1
+    fi
+    _l="$(sed -n "${_IN}p" "$_TMPF")"
+    _IN="${_l%%"$_US"*}"
+    rm -f "$_TMPF"
+    [ -n "$_IN" ] || return 1
+    return 0
+}
+
+_alias_actions() { # <име> — бързи действия върху избран алиас
+    local _name="$1"
+    print_header
+    screen_title "$(T t.edit)"
+    show_alias "$_name" || { printf '\n'; pause; return; }
+    printf '\n'
+    printf "  %b[1]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T cs.act_edit)"
+    printf "  %b[2]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T cs.act_tag)"
+    printf "  %b[3]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T cs.act_cat)"
+    printf "  %b[4]%b %s\n"   "$C_KEY$C_BOLD" "$C_RESET" "$(T cs.act_rm)"
+    printf "  %b[0]%b %s\n\n" "$C_KEY$C_BOLD" "$C_RESET" "$(T cs.act_back)"
+    ask_input "$(T menu.prompt)" || return
+    case "$_IN" in
+        1) edit_alias_flow "$_name" ;;
+        2) _meta_edit_flow "$_name" tags; printf '\n'; pause ;;
+        3) _meta_edit_flow "$_name" category; printf '\n'; pause ;;
+        4)
+            if core_remove "$_name"; then
+                ok "$(T rm.ok "$_name")"
+                reload_hint
+            fi
+            printf '\n'
+            pause
+            ;;
+        *) return ;;
+    esac
+}
+
+tags_screen() {
+    print_header
+    screen_title "$(T t.tags)"
+    local _name _val _tg _ct _t _c _i
+    local _cats="" _tags_all=""
+    while IFS="$_US" read -r _name _val _tg _ct; do
+        [ -n "$_name" ] || continue
+        if [ -n "$_ct" ]; then
+            case "$_cats" in *"$_ct"*) ;; *) _cats="$_cats$_ct"$'\n' ;; esac
+        fi
+        if [ -n "$_tg" ]; then
+            local _oldIFS="$IFS"; IFS=","
+            for _t in $_tg; do
+                [ -n "$_t" ] || continue
+                case "$_tags_all" in *"$_t"*) ;; *) _tags_all="$_tags_all$_t"$'\n' ;; esac
+            done
+            IFS="$_oldIFS"
+        fi
+    done < <(alias_entries)
+    if [ -z "$_cats" ] && [ -z "$_tags_all" ]; then
+        printf '\n'
+        warn "$(T cs.empty)"
+        printf '\n'
+        pause
+        return
+    fi
+    printf '\n'
+    if [ -n "$_cats" ]; then
+        _i=0
+        while IFS= read -r _c; do
+            [ -n "$_c" ] || continue
+            _i=$((_i + 1))
+            printf "  %b[%d]%b %s %b(%s)%b\n" "$C_KEY$C_BOLD" "$_i" "$C_RESET" "$_c" \
+                "$C_DIM" "$(count_cat "$_c")" "$C_RESET"
+        done <<< "$_cats"
+    fi
+    if [ -n "$_tags_all" ]; then
+        printf '\n  %b%s:%b ' "$C_INFO$C_BOLD" "$(T cs.tags_line)" "$C_RESET"
+        while IFS= read -r _t; do
+            [ -n "$_t" ] || continue
+            printf "%b%s%b %b(%s)%b   " "$C_KEY" "$_t" "$C_RESET" \
+                "$C_DIM" "$(count_tag "$_t")" "$C_RESET"
+        done <<< "$_tags_all"
+        printf '\n'
+    fi
+    printf '\n'
+    info "$(T cs.hint)"
+    ask_input "$(T cs.pick_cat)" || return
+    local _sel="$_IN"
+    case "$_sel" in
+        '') return ;;
+        ''|*[!0-9]*)
+            _list_filtered_to_tmp tag "$_sel" || { printf '\n'; pause; return; }
+            ;;
+        *)
+            local _pick=""
+            local _n=0
+            while IFS= read -r _c; do
+                [ -n "$_c" ] || continue
+                _n=$((_n + 1))
+                [ "$_n" = "$_sel" ] && { _pick="$_c"; break; }
+            done <<< "$_cats"
+            if [ -z "$_pick" ]; then
+                fail "$(T ed.bad_pick)"
+                sleep 1
+                return
+            fi
+            _list_filtered_to_tmp cat "$_pick" || { printf '\n'; pause; return; }
+            ;;
+    esac
+    printf '\n'
+    screen_title "$(T t.list)"
+    _pick_alias_from_tmp || { printf '\n'; pause; return; }
+    _alias_actions "$_IN"
+}
+
+lang_screen() {
+    print_header
+    screen_title "$(T lg.current "$LANG_MODE")"
+    dim "  $(T lg.hint)"
+    printf '\n'
+    ask_input "$(T lg.ask)" "$LANG_MODE" || return
+    case "$(lower "$_IN")" in
+        bg|en) cmd_lang "$(lower "$_IN")" ;;
+        '') return ;;
+        *) fail "$(T lg.usage)"; sleep 1; return ;;
+    esac
+    printf '\n'
+    pause
+}
+
+help_screen() {
+    print_header
+    screen_title "$(T t.help)"
+    printf '\n'
+    info "$(T hp.sourced)"
+    printf "  %bsource %s%b\n\n" "$C_VAL" "$ALIASES_FILE" "$C_RESET"
+    info "$(T hp.bashrc)"
+    printf "  %b[ -f \"%s\" ] && source \"%s\"%b\n\n" "$C_VAL" "$ALIASES_FILE" "$ALIASES_FILE" "$C_RESET"
+    dim "$(T hp.autoload)"
+    printf '\n'
+    info "$(T hp.env)"
+    printf "  ALIASHUB_LANG=bg|en · ALIASHUB_FILE · ALIASHUB_BACKUP_DIR · ALIASHUB_MAX_BACKUPS · NO_COLOR\n\n"
+    info "$(T hp.cli)"
+    printf "  %baliashub list%b · %badd%b · %btag%b · %bcategory%b · %bsearch%b · %blang%b · %bdoctor%b\n\n" \
+        "$C_VAL" "$C_RESET" "$C_VAL" "$C_RESET" "$C_VAL" "$C_RESET" "$C_VAL" "$C_RESET" \
+        "$C_VAL" "$C_RESET" "$C_VAL" "$C_RESET" "$C_VAL" "$C_RESET"
+    info "$(T hp.site)"
+    printf "  %b%s%b\n\n" "$C_VAL$C_BOLD" "$ALIASHUB_SITE" "$C_RESET"
+    pause
+}
+
+goodbye() {
+    clear_screen
+    printf '\n%b%s%b\n\n' "$C_SUCCESS$C_BOLD" "$(T gb.bye)" "$C_RESET"
+    exit 0
+}
+
+# ------------------------------ главно меню ---------------------------------
+main_menu() {
+    print_header
+    screen_title "$(T menu.prompt)"
+    printf '\n'
+    menu_row 1 "📋 $(T menu.m1)"
+    menu_row 2 "➕ $(T menu.m2)"
+    menu_row 3 "🔍 $(T menu.m3)"
+    menu_row 4 "✏️  $(T menu.m4)"
+    menu_row 5 "🗑️  $(T menu.m5)"
+    menu_row 6 "📝 $(T menu.m6)"
+    menu_row 7 "💾 $(T menu.m7)"
+    menu_row 8 "🩺 $(T menu.m8)"
+    menu_row 9 "📖 $(T menu.m9)"
+    menu_row 10 "🏷️  $(T menu.m10)"
+    menu_row 11 "🌐 $(T menu.m11)"
+    printf '\n'
+    printf "  %b[q]%b 🚪 %s\n\n" "$C_ERROR$C_BOLD" "$C_RESET" "$(T menu.quit)"
+    printf "  %b➤%b " "$C_PRIMARY$C_BOLD" "$C_RESET"
+    read -r _choice || { printf '\n'; exit 0; }
+    case "$_choice" in
+        1) list_screen ;;
+        2) add_screen ;;
+        3) search_screen ;;
+        4) edit_screen ;;
+        5) remove_screen ;;
+        6) file_screen ;;
+        7) backup_screen ;;
+        8) check_screen ;;
+        9) help_screen ;;
+        10) tags_screen ;;
+        11) lang_screen ;;
+        q|Q) goodbye ;;
+        *) fail "$(T err.invalid_choice)"; sleep 1 ;;
+    esac
+}
+
+run_menu() {
+    ALIASHUB_INTERACTIVE=1
+    pick_editor
+    if [ -t 1 ]; then printf '\033]2;ALIASHUB\007'; fi
+    while true; do
+        main_menu
+    done
+}
+# ============================================================================
+#  p4cli — CLI: версия, помощ, dispatcher, main
+# ============================================================================
+version() {
+    printf 'ALIASHUB v%s — Федя Серафиев — %s\n' "$VERSION" "$ALIASHUB_SITE"
+}
+
+usage() {
+    if [ "$LANG_MODE" = "en" ]; then
+        cat <<'USAGE_EN'
+ALIASHUB — alias manager for Bash & Zsh (by Fedya Serafiev)
+
+Usage: aliashub [options] [command [args]]
+
+Commands:
+  menu                          interactive menu (default)
+  list [--raw] [--tag T] [--category C] [-g]
+                                list aliases (-g = grouped by category)
+  add NAME COMMAND... [--tags a,b] [--category c]
+                                add alias
+  rm NAME                       remove alias
+  rename OLD NEW                rename alias
+  setcmd NAME CMD...            change the command of an alias
+  show NAME                     show one alias (with tags/category)
+  search [TERM]                 search names, commands, tags and categories
+                                (no TERM + fzf = interactive picker)
+  tag NAME [TAGS]               show/set tags (comma-separated; "" clears)
+  category NAME [CAT]           show/set category ("" clears)
+  lang [bg|en]                  show/set interface language (persisted)
+  edit                          open the aliases file in the editor
+  backup                        create a backup now
+  backups                       list backups
+  restore [N|FILE|last]         restore a backup (default: latest)
+  check                         validate the aliases file
+  doctor                        health check (rc files, editor, fzf, backups)
+  init                          add auto-load block to ~/.bashrc and ~/.zshrc
+  stats                         quick statistics (incl. per-category counts)
+  file                          print the aliases file path
+
+Options:
+  --lang bg|en           interface language (default: from config / $LANG)
+  --file PATH            use another aliases file
+  --no-color             disable colors (NO_COLOR env is honored too)
+  -h, --help             show this help
+  -V, --version          show version
+
+Environment:
+  ALIASHUB_LANG=bg|en    ALIASHUB_FILE=PATH    ALIASHUB_BACKUP_DIR=PATH
+  ALIASHUB_MAX_BACKUPS=N                       NO_COLOR=1
+  (legacy ALIASCTL_* names are still honored)
+
+Config file: ~/.config/aliashub/config  (lang=bg|en)
+Names may include Cyrillic and dots: alias ..='cd ..' is perfectly fine.
+Site: https://fedia.eu
+USAGE_EN
+    else
+        cat <<'USAGE_BG'
+ALIASHUB — мениджър на алиаси за Bash и Zsh (по Федя Серафиев)
+
+Употреба: aliashub [опции] [команда [аргументи]]
+
+Команди:
+  menu                          интерактивно меню (по подразбиране)
+  list [--raw] [--tag Т] [--category К] [-g]
+                                списък (-g = групирано по категория)
+  add ИМЕ КОМАНДА... [--tags а,б] [--category к]
+                                добавя алиас
+  rm ИМЕ                        премахва алиас
+  rename СТАРО НОВО             преименува алиас
+  setcmd ИМЕ КОМАНДА...         сменя командата на алиас
+  show ИМЕ                      показва един алиас (с тагове/категория)
+  search [ТЕРМ]                 търсене в имена, команди, тагове и категории
+                                (без ТЕРМ + fzf = интерактивно)
+  tag ИМЕ [ТАГОВЕ]              показва/задава тагове (запетаи; "" изчиства)
+  category ИМЕ [КАТЕГОРИЯ]      показва/задава категория ("" изчиства)
+  lang [bg|en]                  показва/задава езика (запазва се трайно)
+  edit                          отваря файла в редактора
+  backup                        създава backup сега
+  backups                       списък с backup-и
+  restore [N|ФАЙЛ|last]         възстановява backup (по подразбиране: последния)
+  check                         проверява файла за грешки
+  doctor                        диагностика (rc файлове, редактор, fzf, backup-и)
+  init                          добавя авто-зареждане в ~/.bashrc и ~/.zshrc
+  stats                         бърза статистика (вкл. по категории)
+  file                          извежда пътя до файла с алиаси
+
+Опции:
+  --lang bg|en           език на интерфейса (по подразбиране: от конфиг/$LANG)
+  --file ПЪТ             друг файл с алиаси
+  --no-color             без цветове (учитва се и NO_COLOR)
+  -h, --help             тази помощ
+  -V, --version          версия
+
+Променливи на средата:
+  ALIASHUB_LANG=bg|en    ALIASHUB_FILE=ПЪТ    ALIASHUB_BACKUP_DIR=ПЪТ
+  ALIASHUB_MAX_BACKUPS=N                      NO_COLOR=1
+  (остарелите имена ALIASCTL_* продължават да работят)
+
+Конфиг файл: ~/.config/aliashub/config  (lang=bg|en)
+Имената могат да съдържат кирилица и точки: alias ..='cd ..' е напълно ОК.
+Сайт: https://fedia.eu
+USAGE_BG
+    fi
+}
+
+main() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --no-color) USE_COLOR=0; set_color_vars ;;
+            --lang)
+                [ -n "${2:-}" ] || { fail "$(T err.missing_args --lang)"; exit 2; }
+                LANG_MODE="$(lower "$2")"; shift
+                ;;
+            --lang=*) LANG_MODE="$(lower "${1#*=}")" ;;
+            --file)
+                [ -n "${2:-}" ] || { fail "$(T err.missing_args --file)"; exit 2; }
+                ALIASES_FILE="$2"; shift
+                ;;
+            --file=*) ALIASES_FILE="${1#*=}" ;;
+            -h|--help) usage; exit 0 ;;
+            -V|--version) version; exit 0 ;;
+            --) shift; break ;;
+            -*) fail "$(T err.unknown_cmd "$1")"; exit 2 ;;
+            *) break ;;
+        esac
+        shift
+    done
+    case "$LANG_MODE" in bg|en) ;; *) LANG_MODE="bg" ;; esac
+
+    local _cmd="${1:-menu}"
+    if [ "$#" -gt 0 ]; then shift; fi
+
+    case "$_cmd" in
+        ""|menu|interactive) run_menu ;;
+        list|ls)             cmd_list "$@" ;;
+        add)                 cmd_add "$@" ;;
+        rm|remove|del)       cmd_rm "$@" ;;
+        rename|mv)           cmd_rename "$@" ;;
+        setcmd)              cmd_setcmd "$@" ;;
+        show)                cmd_show "$@" ;;
+        search|find)         cmd_search "$@" ;;
+        tag|tags)            cmd_tag "$@" ;;
+        category|cat)        cmd_category "$@" ;;
+        lang)                cmd_lang "$@" ;;
+        edit)                cmd_edit_file ;;
+        file)                printf '%s\n' "$ALIASES_FILE" ;;
+        backup)              cmd_backup ;;
+        backups)             cmd_backups ;;
+        restore)             cmd_restore "$@" ;;
+        check)               cmd_check ;;
+        doctor)              cmd_doctor ;;
+        init)                cmd_init ;;
+        stats)               cmd_stats ;;
+        help)                usage ;;
+        version)             version ;;
+        *)                   fail "$(T err.unknown_cmd "$_cmd")"; exit 2 ;;
+    esac
+}
+
+on_int() {
+    if [ "${ALIASHUB_INTERACTIVE:-0}" = "1" ]; then
+        printf '\n%b%s%b\n\n' "$C_SUCCESS$C_BOLD" "$(T gb.bye)" "$C_RESET"
+        exit 130
+    fi
+    printf '\n'
+    exit 130
+}
+
+main "$@"
